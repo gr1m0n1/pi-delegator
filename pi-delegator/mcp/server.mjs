@@ -51,7 +51,7 @@ export function createConfig(env = process.env) {
   const root = resolve(env.PI_MCP_ALLOWED_ROOT || DEFAULT_ROOT);
   return {
     root,
-    launcher: resolve(env.PI_MCP_PI_AGENT || resolve(root, "pi-delegator/bin/pi-agent")),
+    launcher: resolve(env.PI_MCP_PI_AGENT || resolve(root, ".pi-delegator/bin/pi-agent")),
     launcherArgs: [],
     timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, 1800),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
