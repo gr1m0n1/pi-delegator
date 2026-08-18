@@ -1,7 +1,7 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "LITELLM_BASE_URL",
+      "baseUrl": "$LITELLM_BASE_URL",
       "api": "openai-completions",
       "apiKey": "$LITELLM_API_KEY",
       "authHeader": true,
