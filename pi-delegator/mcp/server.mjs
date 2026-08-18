@@ -53,7 +53,7 @@ export function createConfig(env = process.env) {
     root,
     launcher: resolve(env.PI_MCP_PI_AGENT || resolve(root, ".pi-delegator/bin/pi-agent")),
     launcherArgs: [],
-    timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, 1800),
+    timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, 0),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
     delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(root, "pi-delegator/delegation-sets.json")),
     defaultDelegationSet: String(env.PI_DEFAULT_DELEGATION_SET || FALLBACK_DELEGATION_SET).trim() || FALLBACK_DELEGATION_SET,

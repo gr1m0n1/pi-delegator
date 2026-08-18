@@ -90,7 +90,7 @@ This updates:
 
 The local MCP server supports both a global timeout and a per-tool-call timeout:
 
-- `PI_MCP_TIMEOUT_SECONDS`: default timeout for delegated MCP runs.
+- `PI_MCP_TIMEOUT_SECONDS`: default timeout for delegated MCP runs. If omitted, it defaults to `0`.
 - `timeout_seconds`: optional timeout passed in an individual MCP tool call.
 
 Timeout behavior is:

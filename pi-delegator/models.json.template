@@ -1,7 +1,7 @@
 {
   "providers": {
     "litellm": {
-      "baseUrl": "http://127.0.0.1:4000/v1",
+      "baseUrl": "LITELLM_BASE_URL",
       "api": "openai-completions",
       "apiKey": "$LITELLM_API_KEY",
       "authHeader": true,
