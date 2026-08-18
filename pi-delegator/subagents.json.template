@@ -1,0 +1,14 @@
+{
+  "maxConcurrent": __PI_MAX_CONCURRENT__,
+  "defaultMaxTurns": __MAX_AGENT_TURNS__,
+  "graceTurns": 2,
+  "maxSubagentDepth": __MAX_SUBAGENT_DEPTH__,
+  "joinMode": "smart",
+  "disableDefaultAgents": true,
+  "strictAgentFiles": true,
+  "rememberAgents": true,
+  "outputTranscript": true,
+  "schedulingEnabled": false,
+  "toolDescriptionMode": "compact",
+  "worktreeIsolation": false
+}

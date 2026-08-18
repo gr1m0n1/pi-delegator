@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "pi-delegator": {
+      "type": "stdio",
+      "command": "./.pi-delegator/bin/pi-mcp",
+      "args": []
+    }
+  }
+}

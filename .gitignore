@@ -1,0 +1,9 @@
+.DS_Store
+
+# Pi installation and runtime state
+.pi-delegator/
+!.pi-delegator/.gitignore
+
+# Generated logs
+logs/pi-agents.jsonl
+

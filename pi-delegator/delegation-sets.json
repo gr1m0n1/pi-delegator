@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "sets": {
+    "default": {
+      "delegation_percentage": 50,
+      "roles": {
+        "research": { "model": "llm-large", "reasoning": "medium" },
+        "implement": { "model": "llm-large", "reasoning": "medium" },
+        "tests": { "model": "llm-large", "reasoning": "medium" },
+        "review": { "model": "llm-large", "reasoning": "medium" },
+        "orchestrate": { "model": "llm-large", "reasoning": "medium" }
+      }
+    },
+    "fast": {
+      "delegation_percentage": 75,
+      "roles": {
+        "research": { "model": "llm-medium", "reasoning": "low" },
+        "implement": { "model": "llm-medium-devel", "reasoning": "low" },
+        "tests": { "model": "llm-medium", "reasoning": "low" },
+        "review": { "model": "llm-medium", "reasoning": "low" },
+        "orchestrate": { "model": "llm-large", "reasoning": "low" }
+      }
+    },
+    "balanced": {
+      "delegation_percentage": 60,
+      "roles": {
+        "research": { "model": "llm-medium", "reasoning": "medium" },
+        "implement": { "model": "llm-medium-devel", "reasoning": "high" },
+        "tests": { "model": "llm-medium", "reasoning": "low" },
+        "review": { "model": "llm-medium", "reasoning": "medium" },
+        "orchestrate": { "model": "llm-large", "reasoning": "xhigh" }
+      }
+    },
+    "deep": {
+      "delegation_percentage": 90,
+      "roles": {
+        "research": { "model": "llm-medium-devel", "reasoning": "high" },
+        "implement": { "model": "llm-large", "reasoning": "xhigh" },
+        "tests": { "model": "llm-medium-devel", "reasoning": "medium" },
+        "review": { "model": "llm-medium-devel", "reasoning": "high" },
+        "orchestrate": { "model": "llm-large", "reasoning": "xhigh" }
+      }
+    }
+  }
+}

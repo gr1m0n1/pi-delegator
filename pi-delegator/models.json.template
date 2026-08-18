@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "litellm": {
+      "baseUrl": "http://127.0.0.1:4000/v1",
+      "api": "openai-completions",
+      "apiKey": "$LITELLM_API_KEY",
+      "authHeader": true,
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "supportsUsageInStreaming": true
+      },
+      "models": [
+        { "id": "llm-large", "name": "LiteLLM large/orchestrator", "reasoning": true, "contextWindow": 131072, "maxTokens": 8192 },
+        { "id": "llm-medium-devel", "name": "LiteLLM coder", "reasoning": false, "contextWindow": 65535, "maxTokens": 8192 },
+        { "id": "llm-medium", "name": "LiteLLM researcher/reviewer", "reasoning": false, "contextWindow": 65535, "maxTokens": 8192 },
+        { "id": "llm-small", "name": "LiteLLM tester/fast", "reasoning": false, "contextWindow": 65535, "maxTokens": 4096 }
+      ]
+    }
+  }
+}

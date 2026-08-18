@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "pi-delegator": {
+      "command": "./.pi-delegator/bin/pi-mcp",
+      "args": []
+    }
+  }
+}

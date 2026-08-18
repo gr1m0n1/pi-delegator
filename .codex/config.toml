@@ -1,0 +1,5 @@
+# BEGIN pi-delegator managed MCP
+[mcp_servers."pi-delegator"]
+command = "./.pi-delegator/bin/pi-mcp"
+args = []
+# END pi-delegator managed MCP
