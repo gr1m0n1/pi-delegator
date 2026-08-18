@@ -51,7 +51,11 @@ async function atomicWrite(path, contents) {
 await syncPiInstallation();
 await mkdir(runtime, { recursive: true, mode: 0o700 });
 const modelTemplate = await readFile(`${sourceDir}/models.json.template`, "utf8");
-const models = modelTemplate.replaceAll("__LITELLM_BASE_URL__", baseUrl.href.replace(/\/$/, ""));
+const models = modelTemplate
+  .replaceAll("__LITELLM_BASE_URL__", baseUrl.href.replace(/\/$/, ""))
+  .replaceAll("$LITELLM_BASE_URL", baseUrl.href.replace(/\/$/, ""))
+  .replaceAll("__LITELLM_API_KEY__", process.env.LITELLM_API_KEY)
+  .replaceAll("$LITELLM_API_KEY", process.env.LITELLM_API_KEY);
 JSON.parse(models);
 if (/__[A-Z0-9_]+__/.test(models)) throw new Error("unresolved placeholder in models.json");
 await atomicWrite(`${runtime}/models.json`, models);
