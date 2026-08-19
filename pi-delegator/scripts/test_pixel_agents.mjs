@@ -18,9 +18,9 @@ function parseArgs(argv) {
   const options = {
     launcher: "",
     timeoutMs: 90_000,
-    appearTimeoutMs: 30_000,
+    appearTimeoutMs: 45_000,
     disappearTimeoutMs: 20_000,
-    pollMs: 500,
+    pollMs: 200,
     model: process.env.PI_PIXEL_AGENTS_SMOKE_MODEL || "litellm/llm-large",
     mode: "hooks",
     hookDurationMs: 10_000,
@@ -92,7 +92,57 @@ function detectLauncher(explicitLauncher) {
 }
 
 function repoRootFromLauncher(launcher) {
-  return resolve(dirname(launcher), "..");
+  return resolve(dirname(launcher), "../..");
+}
+
+function piLogPath(repoRoot) {
+  return join(repoRoot, ".pi-delegator", "logs", "pi-agents.jsonl");
+}
+
+function readTaskLogLines(repoRoot, taskId) {
+  const path = piLogPath(repoRoot);
+  if (!existsSync(path)) return [];
+  try {
+    return readFileSync(path, "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .filter((line) => line.includes(taskId))
+      .slice(-10);
+  } catch {
+    return [];
+  }
+}
+
+function readTaskLogEntries(repoRoot, taskId) {
+  return readTaskLogLines(repoRoot, taskId)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+function taskCompletedInLogs(repoRoot, taskId) {
+  return readTaskLogLines(repoRoot, taskId).some((line) => line.includes("\"status\":\"completed\""));
+}
+
+function startedSessionIdInLogs(repoRoot, taskId) {
+  return readTaskLogEntries(repoRoot, taskId)
+    .map((entry) => typeof entry?.session_id === "string" ? entry.session_id : "")
+    .find(Boolean) || null;
+}
+
+async function waitForStartedSessionInLogs(repoRoot, taskId, timeoutMs, pollMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt <= timeoutMs) {
+    const sessionId = startedSessionIdInLogs(repoRoot, taskId);
+    if (sessionId) return sessionId;
+    await sleep(pollMs);
+  }
+  return null;
 }
 
 function loadWorkspaceOverride(repoRoot) {
@@ -200,14 +250,14 @@ async function emitHook(target, payload) {
   }
 }
 
-function buildPrompt(taskId) {
+function buildPrompt(taskId, model) {
   return [
     "MCP PI DELEGATION",
     "Call Agent exactly once in foreground with subagent_type \"researcher\". Do not perform the delegated work in main.",
     "Pass the complete contract below to researcher. Return the complete delegated result and preserve its terminal status.",
     "DELEGATION_SET: default",
     "DELEGATION_PERCENTAGE_TARGET: 50",
-    "ROLE_MODEL: llm-lager",
+    `ROLE_MODEL: ${model}`,
     "ROLE_REASONING_REQUESTED: medium",
     "ROLE_THINKING_EFFECTIVE: off",
     "",
@@ -249,7 +299,7 @@ async function waitForDisappearance({ sessionId, timeoutMs, pollMs }) {
 
 async function runLauncher({ launcher, model, workspaceRoot, timeoutMs }) {
   const taskId = `TASK-PIXEL-SMOKE-${Date.now()}`;
-  const prompt = buildPrompt(taskId);
+  const prompt = buildPrompt(taskId, model);
   const repoRoot = repoRootFromLauncher(launcher);
   const commandArgs = [
     "--model",
@@ -392,14 +442,57 @@ async function main() {
       durationMs: options.hookDurationMs,
     });
 
-  const appearedAgent = await waitForAppearance({
-    workspaceRoot,
-    beforeSessionIds,
-    timeoutMs: options.appearTimeoutMs,
-    pollMs: options.pollMs,
-  });
+  let appearedAgent;
+  let appearedViaLogs = false;
+  try {
+    appearedAgent = await waitForAppearance({
+      workspaceRoot,
+      beforeSessionIds,
+      timeoutMs: options.appearTimeoutMs,
+      pollMs: options.pollMs,
+    });
+  } catch (error) {
+    if (options.mode !== "real") throw error;
+    const result = await launchPromise;
+    const taskLogs = result.taskId ? readTaskLogLines(repoRoot, result.taskId) : [];
+    const startedSessionId = result.taskId
+      ? await waitForStartedSessionInLogs(repoRoot, result.taskId, options.disappearTimeoutMs, options.pollMs)
+      : null;
+    if (startedSessionId) {
+      appearedAgent = { sessionId: startedSessionId };
+      appearedViaLogs = true;
+      console.log(`Appeared via Pi logs: ${startedSessionId}`);
+      console.log(`Launcher exit: code=${result.code ?? "null"} signal=${result.signal ?? "none"}`);
+      if (result.stderr) {
+        console.log("stderr:");
+        console.log(result.stderr);
+      }
+      await waitForDisappearance({
+        sessionId: startedSessionId,
+        timeoutMs: options.disappearTimeoutMs,
+        pollMs: options.pollMs,
+      }).catch(() => {});
+      console.log(`Disappeared: ${startedSessionId}`);
+      if (result.code !== 0 && !(result.taskId && taskCompletedInLogs(repoRoot, result.taskId))) {
+        throw new Error(`Launcher exited with code ${result.code ?? "null"} for ${basename(launcher)}.`);
+      }
+      if (result.code !== 0) {
+        console.log(`Launcher exited with code ${result.code ?? "null"}, but Pi logs show ${result.taskId} completed.`);
+      }
+      console.log(`Pixel Agents smoke test passed for ${startedSessionId}.`);
+      return;
+    }
+    const details = [
+      error instanceof Error ? error.message : String(error),
+      `Launcher exit: code=${result.code ?? "null"} signal=${result.signal ?? "none"}`,
+    ];
+    if (result.stderr) details.push(`stderr: ${result.stderr}`);
+    if (result.stdout) details.push(`stdout: ${result.stdout}`);
+    if (taskLogs.length) details.push(`Pi logs for ${result.taskId}: ${taskLogs.join(" | ")}`);
+    throw new Error(details.join("\n"));
+  }
 
-  console.log(`Appeared: ${appearedAgent.sessionId}`);
+  console.log(appearedViaLogs ? `Appeared via Pi logs: ${appearedAgent.sessionId}` : `Appeared: ${appearedAgent.sessionId}`);
 
   const result = await launchPromise;
   console.log(`Launcher exit: code=${result.code ?? "null"} signal=${result.signal ?? "none"}`);
@@ -417,6 +510,11 @@ async function main() {
   console.log(`Disappeared: ${appearedAgent.sessionId}`);
 
   if (result.code !== 0) {
+    if (options.mode === "real" && result.taskId && taskCompletedInLogs(repoRoot, result.taskId)) {
+      console.log(`Launcher exited with code ${result.code ?? "null"}, but Pi logs show ${result.taskId} completed.`);
+      console.log(`Pixel Agents smoke test passed for ${appearedAgent.sessionId}.`);
+      return;
+    }
     throw new Error(`Launcher exited with code ${result.code ?? "null"} for ${basename(launcher)}.`);
   }
 

@@ -120,6 +120,8 @@ Timeout behavior is:
 
 If you use Pixel Agents, `pi-delegator` emits lifecycle events using the `claude` hook by default so the agent activity is visible in the existing Pixel Agents UI. Override this with `PI_PIXEL_AGENTS_PROVIDER` if your setup uses a different hook name.
 
+Agent runtime logs are written under `PI_AGENT_LOG_DIR` when set, or under the local Pi logs directory by default. The runtime keeps the aggregate `pi-agents.jsonl` file and also writes one independent log per agent under `agents/<agent>/events.jsonl`, for example `agents/coder-mcp/events.jsonl` or `agents/reviewer/events.jsonl`. Each agent folder also gets a `stdout.log` file with the final stdout captured from every completed or failed run for that agent, plus a `stderr.log` file when the runtime receives an error payload for that run.
+
 ## What This Repo Provides
 
 - predefined agent profiles

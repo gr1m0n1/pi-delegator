@@ -84,13 +84,98 @@ function appendLog(payload: Record<string, unknown>): void {
   try {
     const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    appendFileSync(join(directory, "pi-agents.jsonl"), `${JSON.stringify(payload)}\n`, {
+    const line = `${JSON.stringify(payload)}\n`;
+    appendFileSync(join(directory, "pi-agents.jsonl"), line, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const agentLogFile = agentLogPath(directory, payload);
+    if (agentLogFile) {
+      appendFileSync(agentLogFile, line, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+    }
+  } catch (error) {
+    process.stderr.write(`[pi-agent-runtime] logging warning: ${String(error)}\n`);
+  }
+}
+
+function appendAgentStdout(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stdout: unknown }): void {
+  try {
+    const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stdoutPath = agentStdoutPath(directory, agent);
+    if (!stdoutPath) return;
+    const body = typeof payload.stdout === "string" ? payload.stdout : payload.stdout == null ? "" : String(payload.stdout);
+    const header = [
+      `[${payload.timestamp}] status=${payload.status} task_id=${payload.taskId ?? "null"} session_id=${payload.sessionId ?? "null"}`,
+      "",
+    ].join("\n");
+    const content = body.endsWith("\n") ? body : `${body}\n`;
+    appendFileSync(stdoutPath, `${header}${content}\n`, {
       encoding: "utf8",
       mode: 0o600,
     });
   } catch (error) {
-    process.stderr.write(`[pi-agent-runtime] logging warning: ${String(error)}\n`);
+    process.stderr.write(`[pi-agent-runtime] stdout logging warning: ${String(error)}\n`);
   }
+}
+
+function appendAgentStderr(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stderr: unknown }): void {
+  try {
+    const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const stderrPath = agentStderrPath(directory, agent);
+    if (!stderrPath) return;
+    const body = typeof payload.stderr === "string" ? payload.stderr : payload.stderr == null ? "" : String(payload.stderr);
+    if (!body.trim()) return;
+    const header = [
+      `[${payload.timestamp}] status=${payload.status} task_id=${payload.taskId ?? "null"} session_id=${payload.sessionId ?? "null"}`,
+      "",
+    ].join("\n");
+    const content = body.endsWith("\n") ? body : `${body}\n`;
+    appendFileSync(stderrPath, `${header}${content}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  } catch (error) {
+    process.stderr.write(`[pi-agent-runtime] stderr logging warning: ${String(error)}\n`);
+  }
+}
+
+function agentLogPath(directory: string, payload: Record<string, unknown>): string | null {
+  const agentDirectory = resolveAgentLogDirectory(directory, payload.agent, payload.delegated_to, payload.parent_agent);
+  return agentDirectory ? join(agentDirectory, "events.jsonl") : null;
+}
+
+function agentStdoutPath(directory: string, agent: unknown): string | null {
+  const agentDirectory = resolveAgentLogDirectory(directory, agent);
+  return agentDirectory ? join(agentDirectory, "stdout.log") : null;
+}
+
+function agentStderrPath(directory: string, agent: unknown): string | null {
+  const agentDirectory = resolveAgentLogDirectory(directory, agent);
+  return agentDirectory ? join(agentDirectory, "stderr.log") : null;
+}
+
+function resolveAgentLogDirectory(directory: string, ...values: unknown[]): string | null {
+  const agent =
+    values
+      .map((value) => sanitizeLogName(value))
+      .find((value): value is string => Boolean(value));
+  if (!agent) return null;
+  const agentDirectory = join(directory, "agents", agent);
+  mkdirSync(agentDirectory, { recursive: true, mode: 0o700 });
+  return agentDirectory;
+}
+
+function sanitizeLogName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const normalized = trimmed.replace(/[^a-zA-Z0-9_-]/g, "-").replace(/-+/g, "-");
+  return normalized || null;
 }
 
 function taskId(result: unknown): string | null {
@@ -675,7 +760,16 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
     const delegated = pending.shift();
     if (delegated?.taskId) shared.taskIds.set(event.id, delegated.taskId);
     shared.pendingDelegations.set(event.type, pending);
-    if (!delegated) return;
+    if (!delegated) {
+      appendLog({
+        timestamp: new Date().toISOString(),
+        event: "subagent_started_without_pending",
+        subagent_id: event.id,
+        agent: event.type,
+        status: "orphaned",
+      });
+      return;
+    }
 
     await reconcileStalePixelAgentSessions(delegated.workspaceCwd);
     const transcriptPath = preparePixelAgentsTranscript(delegated.workspaceCwd, delegated.sessionId);
@@ -686,6 +780,18 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
       startedAt: Date.now(),
     };
     if (!beginPixelAgentSession(event.id, session)) return;
+    appendLog({
+      timestamp: new Date().toISOString(),
+      event: "pixel_agent_session_started",
+      subagent_id: event.id,
+      task_id: delegated.taskId,
+      session_id: session.sessionId,
+      parent_agent: delegated.parentAgent,
+      agent: event.type,
+      transcript_path: transcriptPath,
+      cwd: delegated.workspaceCwd,
+      status: "started",
+    });
 
     const { toolName, toolInput } = pixelToolContext(event.type, delegated.task);
     const role = pixelAgentRole(event.type);
@@ -734,9 +840,12 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
     const start = shared.started.get(String(event.id)) ?? end - duration;
     const tokens = (event.tokens ?? {}) as Record<string, unknown>;
     const effectiveStatus = String(event.status ?? terminalReason ?? "unknown");
+    const timestamp = new Date(end).toISOString();
+    const resolvedTaskId = taskId(event.result) ?? shared.taskIds.get(String(event.id)) ?? null;
+    const activeSession = shared.activeSessions.get(String(event.id)) ?? null;
     appendLog({
-      timestamp: new Date(end).toISOString(),
-      task_id: taskId(event.result) ?? shared.taskIds.get(String(event.id)) ?? null,
+      timestamp,
+      task_id: resolvedTaskId,
       parent_agent: "main",
       agent: event.type ?? null,
       model: modelFor(String(event.type ?? "")),
@@ -751,7 +860,20 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
       status: effectiveStatus,
       error: event.error ?? null,
     });
-    const activeSession = shared.activeSessions.get(String(event.id)) ?? null;
+    appendAgentStdout(event.type, {
+      timestamp,
+      status: effectiveStatus,
+      taskId: resolvedTaskId,
+      sessionId: activeSession?.sessionId ?? null,
+      stdout: event.result,
+    });
+    appendAgentStderr(event.type, {
+      timestamp,
+      status: effectiveStatus,
+      taskId: resolvedTaskId,
+      sessionId: activeSession?.sessionId ?? null,
+      stderr: event.error,
+    });
     if (activeSession) {
       endPixelAgentSession(String(event.id));
       await emitPixelAgentSessionEnd(activeSession, terminalReason);
