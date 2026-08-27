@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { DelegationPolicy, dangerousCommand } from "./delegation-policy.mjs";
@@ -49,6 +49,11 @@ const PIXEL_AGENTS_SERVERS_PATH = join(homedir(), ".pixel-agents", "servers");
 const PIXEL_AGENTS_VSCODE_STATE_PATH = join(homedir(), ".pixel-agents", "vscode-state.json");
 const PIXEL_AGENTS_TIMEOUT_MS = Math.max(250, Number.parseInt(process.env.PI_PIXEL_AGENTS_TIMEOUT_MS ?? "2000", 10) || 2000);
 const CLAUDE_PROJECTS_ROOT = join(homedir(), ".claude", "projects");
+const PI_RUNTIME_ROOT = resolve(process.env.PI_CODING_AGENT_DIR || join(process.cwd(), ".pi-delegator"));
+const PI_SOURCE_ROOT = resolve(
+  process.env.PI_DELEGATOR_SOURCE_ROOT
+  || (existsSync(join(process.cwd(), "pi-delegator", "agents")) ? join(process.cwd(), "pi-delegator") : PI_RUNTIME_ROOT),
+);
 let cachedPixelAgentsWebSocket: Promise<PixelAgentsWebSocketConstructor | null> | null = null;
 const shared = ((globalThis as Record<PropertyKey, unknown>)[stateKey] ??= {
   policy: new DelegationPolicy(Number.parseInt(process.env.MAX_SUBAGENT_CALLS ?? "12", 10) || 12),
@@ -73,16 +78,20 @@ type PixelAgentsWebSocketConstructor = new (
 
 function modelFor(agent: string): string | null {
   try {
-    const body = readFileSync(join(process.cwd(), "pi-delegator", "agents", `${agent}.md`), "utf8");
+    const body = readFileSync(join(PI_SOURCE_ROOT, "agents", `${agent}.md`), "utf8");
     return /^model:\s*(.+)$/m.exec(body)?.[1]?.trim() ?? null;
   } catch {
     return null;
   }
 }
 
+function piLogDirectory(): string {
+  return process.env.PI_AGENT_LOG_DIR || join(PI_RUNTIME_ROOT, "logs");
+}
+
 function appendLog(payload: Record<string, unknown>): void {
   try {
-    const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
+    const directory = piLogDirectory();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const line = `${JSON.stringify(payload)}\n`;
     appendFileSync(join(directory, "pi-agents.jsonl"), line, {
@@ -103,7 +112,7 @@ function appendLog(payload: Record<string, unknown>): void {
 
 function appendAgentStdout(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stdout: unknown }): void {
   try {
-    const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
+    const directory = piLogDirectory();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stdoutPath = agentStdoutPath(directory, agent);
     if (!stdoutPath) return;
@@ -124,7 +133,7 @@ function appendAgentStdout(agent: unknown, payload: { timestamp: string; status:
 
 function appendAgentStderr(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stderr: unknown }): void {
   try {
-    const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), "logs");
+    const directory = piLogDirectory();
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const stderrPath = agentStderrPath(directory, agent);
     if (!stderrPath) return;
@@ -185,8 +194,7 @@ function taskId(result: unknown): string | null {
 }
 
 function pixelAgentsStatePath(): string {
-  const directory = process.env.PI_AGENT_LOG_DIR || join(process.cwd(), ".pi-delegator", "logs");
-  return join(directory, "pixel-agents-active-sessions.json");
+  return join(piLogDirectory(), "pixel-agents-active-sessions.json");
 }
 
 function pixelAgentsWorkspaceCwd(): string {

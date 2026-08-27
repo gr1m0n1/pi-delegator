@@ -5,8 +5,11 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const sourceDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
-const projectRoot = resolve(sourceDir, "..");
-const serverCommand = "./.pi-delegator/bin/pi-mcp";
+const sourceProjectRoot = resolve(sourceDir, "..");
+const projectRoot = resolve(process.env.PI_MCP_ALLOWED_ROOT || sourceProjectRoot);
+const defaultRuntime = resolve(projectRoot, ".pi-delegator");
+const runtime = resolve(process.env.PI_CODING_AGENT_DIR || defaultRuntime);
+const serverCommand = runtime === defaultRuntime ? "./.pi-delegator/bin/pi-mcp" : resolve(runtime, "bin/pi-mcp");
 
 function usage() {
   console.error("Usage: node configure_clients.mjs [--copilot] [--codex] [--claude] [--all-clients]");

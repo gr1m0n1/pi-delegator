@@ -3,23 +3,34 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_root="${project_root}/pi-delegator"
-runtime_root="${PI_CODING_AGENT_DIR:-${project_root}/.pi-delegator}"
+if [[ ! -d "${source_root}/scripts" && -d "${project_root}/.pi-delegator/scripts" ]]; then
+  source_root="${project_root}/.pi-delegator"
+fi
 node_version="${PI_NODE_VERSION:-22.22.1}"
 pi_version="${PI_CODING_AGENT_VERSION:-0.84.2}"
 subagents_package="${PI_SUBAGENTS_PACKAGE:-npm:@tintinweb/pi-subagents@0.17.0}"
 env_example="${source_root}/pi.env.example"
-env_file="${runtime_root}/pi.env"
 client_flags=()
+target_root="${PI_DELEGATOR_TARGET_ROOT:-${project_root}}"
 
 while (($#)); do
   case "$1" in
+    --install-dir|--dir)
+      [[ $# -ge 2 ]] || { echo "$1 requires a value" >&2; exit 2; }
+      target_root="$(realpath -m "$2")"
+      shift 2
+      ;;
     --copilot|--codex|--claude|--all-clients)
       client_flags+=("$1")
       shift
       ;;
     --help|-h)
       cat <<'EOF'
-Usage: ./pi-delegator/scripts/install.sh [--copilot] [--codex] [--claude] [--all-clients]
+Usage: install.sh [--install-dir DIR] [--copilot] [--codex] [--claude] [--all-clients]
+
+Options:
+  --install-dir DIR  Install .pi-delegator inside DIR instead of the current repo
+  --dir DIR          Alias for --install-dir
 
 Optional integrations:
   --copilot      Update .vscode/mcp.json
@@ -36,6 +47,10 @@ EOF
   esac
 done
 
+target_root="$(realpath -m "${target_root}")"
+runtime_root="${target_root}/.pi-delegator"
+env_file="${runtime_root}/pi.env"
+
 nvm_script="${NVM_DIR:-${HOME}/.nvm}/nvm.sh"
 if [[ ! -s "$nvm_script" ]]; then
   echo "NVM not found at $nvm_script" >&2
@@ -50,6 +65,7 @@ nvm install "${node_version}" >/dev/null
 nvm use "${node_version}" >/dev/null
 
 echo "[2/6] Ensure Pi runtime directory"
+mkdir -p "${target_root}"
 mkdir -p "${runtime_root}"
 chmod 700 "${runtime_root}"
 
@@ -57,7 +73,7 @@ echo "[3/6] Install Pi coding agent ${pi_version}"
 timeout 180s npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${pi_version}"
 
 echo "[4/6] Sync source into ${runtime_root}"
-timeout 30s node "${source_root}/scripts/sync_pi_installation.mjs"
+timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${target_root}" node "${source_root}/scripts/sync_pi_installation.mjs"
 
 echo "[5/6] Install Pi subagents package"
 timeout 180s env PI_CODING_AGENT_DIR="${runtime_root}" pi install "${subagents_package}" --approve
@@ -72,15 +88,18 @@ fi
 
 if ((${#client_flags[@]})); then
   echo "[7/7] Configure client integrations"
-  timeout 30s node "${source_root}/scripts/configure_clients.mjs" "${client_flags[@]}"
+  timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${target_root}" node "${source_root}/scripts/configure_clients.mjs" "${client_flags[@]}"
 fi
+
+printf -v runtime_root_q '%q' "${runtime_root}"
+printf -v target_root_q '%q' "${target_root}"
 
 cat <<EOF
 Install complete.
 
 Next:
 1. Edit ${env_file}
-2. Run ./pi-delegator/scripts/check_pi_setup.sh
-3. Start ./.pi-delegator/bin/pi-agent
-4. Or run Pi directly with ./.pi-delegator/bin/pi
+2. Run PI_CODING_AGENT_DIR=${runtime_root_q} PI_MCP_ALLOWED_ROOT=${target_root_q} ${runtime_root}/scripts/check_pi_setup.sh
+3. Start ${runtime_root}/bin/pi-agent
+4. Or run Pi directly with ${runtime_root}/bin/pi
 EOF
