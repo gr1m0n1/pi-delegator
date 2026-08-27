@@ -55,7 +55,7 @@ export function createConfig(env = process.env) {
     launcherArgs: [],
     timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, 0),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
-    delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(root, "pi-delegator/delegation-sets.json")),
+    delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(root, ".pi-delegator/delegation-sets.json")),
     defaultDelegationSet: String(env.PI_DEFAULT_DELEGATION_SET || FALLBACK_DELEGATION_SET).trim() || FALLBACK_DELEGATION_SET,
   };
 }
@@ -85,7 +85,7 @@ function validateReasoning(value) {
 }
 
 function allowedModels(config) {
-  const document = parseJsonFile(resolve(config.root, "pi-delegator/models.json.template"), "Pi model catalog");
+  const document = parseJsonFile(resolve(config.root, ".pi-delegator/models.json.template"), "Pi model catalog");
   const models = document?.providers?.litellm?.models;
   if (!Array.isArray(models)) throw new Error("Pi model catalog does not define providers.litellm.models");
   return new Set(models.map(({ id }) => id).filter((id) => typeof id === "string" && id));
@@ -409,7 +409,7 @@ function commonProperties(includePaths) {
     constraints: { type: "string", description: "Safety, architecture, and execution constraints." },
     expected_output: { type: "string", description: "Required evidence and response format." },
     timeout_seconds: { type: "integer", minimum: 0, maximum: 7200, description: "0 disables the timeout." },
-    delegation_set: { type: "string", description: "Named set from pi-delegator/delegation-sets.json." },
+    delegation_set: { type: "string", description: "Named set from .pi-delegator/delegation-sets.json." },
     delegation_percentage: {
       type: "integer",
       minimum: 0,
@@ -491,7 +491,7 @@ export function status(config = createConfig()) {
   for (const [label, path, mode] of [
     ["workspace", config.root, constants.R_OK],
     ["launcher", config.launcher, constants.R_OK | constants.X_OK],
-    ["Pi settings", resolve(config.root, "pi-delegator/settings.json"), constants.R_OK],
+    ["Pi settings", resolve(config.root, ".pi-delegator/settings.json"), constants.R_OK],
     ["Pi environment", resolve(config.root, ".pi-delegator/pi.env"), constants.R_OK],
   ]) {
     try {
