@@ -3,8 +3,11 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_root="${project_root}/pi-delegator"
+if [[ ! -d "${source_root}/scripts" && -d "${project_root}/.pi-delegator/scripts" ]]; then
+  source_root="${project_root}/.pi-delegator"
+fi
 runtime_root="${PI_CODING_AGENT_DIR:-${project_root}/.pi-delegator}"
-env_file="${PI_AGENT_ENV_FILE:-${project_root}/.pi-delegator/pi.env}"
+env_file="${PI_AGENT_ENV_FILE:-${runtime_root}/pi.env}"
 if [[ -f "$env_file" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -19,7 +22,7 @@ if [[ -s "$nvm_script" ]]; then
   nvm use "${PI_NODE_VERSION:-22.22.1}" >/dev/null
 fi
 
-timeout 30s node "${source_root}/scripts/sync_pi_installation.mjs"
+timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${project_root}" node "${source_root}/scripts/sync_pi_installation.mjs"
 
 errors=0
 check() {
@@ -35,10 +38,11 @@ check() {
 
 check "Pi installed" pi --version
 check "Node compatible" node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
-check "agent file permissions" bash -c '! find "$1/pi-delegator/agents" -type f -perm /022 -print -quit | grep -q .' _ "$project_root"
+check "agent file permissions" bash -c '! find "$1/agents" -type f -perm /022 -print -quit | grep -q .' _ "$source_root"
 
 if [[ -n "${LITELLM_BASE_URL:-}" && -n "${LITELLM_API_KEY:-}" ]]; then
   export PI_CODING_AGENT_DIR="${runtime_root}"
+  export PI_MCP_ALLOWED_ROOT="${project_root}"
   check "runtime config render" node "${source_root}/scripts/render_pi_config.mjs"
   check "LiteLLM models" node --input-type=module -e '
     const base = process.env.LITELLM_BASE_URL;

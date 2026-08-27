@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { chmod, copyFile, cp, mkdir, rm, writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const sourceDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const projectRoot = resolve(sourceDir, "..");
 const installDir = resolve(process.env.PI_CODING_AGENT_DIR || `${projectRoot}/.pi-delegator`);
+const targetRoot = resolve(process.env.PI_MCP_ALLOWED_ROOT || resolve(installDir, ".."));
+const inPlaceSync = relative(sourceDir, installDir) === "" && relative(installDir, sourceDir) === "";
 const workspaceMetadataFile = ".pixel-agents-workspace-root";
 const managedFiles = [
   "APPEND_SYSTEM.md",
@@ -27,12 +29,20 @@ const obsoleteDirectories = [
   "tests",
 ];
 
-const runtimeBinFiles = {
+function shellLiteral(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function createRuntimeBinFiles() {
+  const targetProjectRoot = shellLiteral(targetRoot);
+  const sourceRuntimeRoot = shellLiteral(sourceDir);
+
+  return {
   pi: `#!/usr/bin/env bash
 set -euo pipefail
 
-project_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
-env_file="\${PI_AGENT_ENV_FILE:-\${project_root}/pi.env}"
+install_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+env_file="\${PI_AGENT_ENV_FILE:-\${install_root}/pi.env}"
 if [[ -f "\$env_file" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -55,10 +65,10 @@ exec pi "\$@"
   "pi-agent": `#!/usr/bin/env bash
 set -euo pipefail
 
-project_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
-source_root="\${project_root}/pi-delegator"
-env_file="\${PI_AGENT_ENV_FILE:-\${project_root}/.pi-delegator/pi.env}"
-workspace_root_file="\${PI_CODING_AGENT_DIR:-\${project_root}/.pi-delegator}/${workspaceMetadataFile}"
+install_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+project_root=\${PI_DELEGATOR_PROJECT_ROOT:-${targetProjectRoot}}
+source_root=\${PI_DELEGATOR_SOURCE_ROOT:-${sourceRuntimeRoot}}
+env_file="\${PI_AGENT_ENV_FILE:-\${install_root}/pi.env}"
 if [[ -f "\$env_file" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -66,8 +76,10 @@ if [[ -f "\$env_file" ]]; then
   set +a
 fi
 
-export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-\${project_root}/.pi-delegator}"
-export PI_AGENT_LOG_DIR="\${PI_AGENT_LOG_DIR:-\${project_root}/.pi-delegator/logs}"
+export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-\${install_root}}"
+export PI_MCP_ALLOWED_ROOT="\${PI_MCP_ALLOWED_ROOT:-\${project_root}}"
+workspace_root_file="\${PI_CODING_AGENT_DIR}/${workspaceMetadataFile}"
+export PI_AGENT_LOG_DIR="\${PI_AGENT_LOG_DIR:-\${PI_CODING_AGENT_DIR}/logs}"
 export PI_TELEMETRY="\${PI_TELEMETRY:-0}"
 export PI_SKIP_VERSION_CHECK="\${PI_SKIP_VERSION_CHECK:-1}"
 export MAX_SUBAGENT_CALLS="\${MAX_SUBAGENT_CALLS:-12}"
@@ -120,10 +132,10 @@ exec pi "\${pi_args[@]}" "\${args[@]}"
   "pi-mcp": `#!/usr/bin/env bash
 set -euo pipefail
 
-project_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/../.." && pwd)"
-source_root="\${project_root}/pi-delegator"
-env_file="\${PI_AGENT_ENV_FILE:-\${project_root}/.pi-delegator/pi.env}"
-workspace_root_file="\${PI_CODING_AGENT_DIR:-\${project_root}/.pi-delegator}/${workspaceMetadataFile}"
+install_root="$(cd "$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
+project_root=\${PI_DELEGATOR_PROJECT_ROOT:-${targetProjectRoot}}
+source_root=\${PI_DELEGATOR_SOURCE_ROOT:-${sourceRuntimeRoot}}
+env_file="\${PI_AGENT_ENV_FILE:-\${install_root}/pi.env}"
 if [[ -f "\$env_file" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -131,34 +143,44 @@ if [[ -f "\$env_file" ]]; then
   set +a
 fi
 
+export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-\${install_root}}"
+workspace_root_file="\${PI_CODING_AGENT_DIR}/${workspaceMetadataFile}"
 export PI_MCP_ALLOWED_ROOT="\${PI_MCP_ALLOWED_ROOT:-\${project_root}}"
+export PI_MCP_PI_AGENT="\${PI_MCP_PI_AGENT:-\${PI_CODING_AGENT_DIR}/bin/pi-agent}"
+export PI_DELEGATION_SETS_FILE="\${PI_DELEGATION_SETS_FILE:-\${PI_CODING_AGENT_DIR}/delegation-sets.json}"
+export PI_MODELS_CATALOG_FILE="\${PI_MODELS_CATALOG_FILE:-\${PI_CODING_AGENT_DIR}/models.json.template}"
 if [[ -z "\${PI_PIXEL_AGENTS_WORKSPACE_CWD:-}" && -f "\$workspace_root_file" ]]; then
   PI_PIXEL_AGENTS_WORKSPACE_CWD="$(head -n 1 "\$workspace_root_file" | tr -d '\r')"
   export PI_PIXEL_AGENTS_WORKSPACE_CWD
 fi
 
 timeout 30s node "\${source_root}/scripts/sync_pi_installation.mjs"
-exec node "\${project_root}/.pi-delegator/mcp/server.mjs"
+exec node "\${PI_CODING_AGENT_DIR}/mcp/server.mjs"
 `,
-};
+  };
+}
 
 export async function syncPiInstallation() {
+  const runtimeBinFiles = createRuntimeBinFiles();
+
   await mkdir(installDir, { recursive: true, mode: 0o700 });
 
-  for (const directory of obsoleteDirectories) {
-    await rm(resolve(installDir, directory), { recursive: true, force: true });
+  if (!inPlaceSync) {
+    for (const directory of obsoleteDirectories) {
+      await rm(resolve(installDir, directory), { recursive: true, force: true });
+    }
+
+    for (const directory of managedDirectories) {
+      await rm(resolve(installDir, directory), { recursive: true, force: true });
+      await cp(resolve(sourceDir, directory), resolve(installDir, directory), { recursive: true });
+    }
+
+    for (const file of managedFiles) {
+      await copyFile(resolve(sourceDir, file), resolve(installDir, file));
+    }
   }
 
-  for (const directory of managedDirectories) {
-    await rm(resolve(installDir, directory), { recursive: true, force: true });
-    await cp(resolve(sourceDir, directory), resolve(installDir, directory), { recursive: true });
-  }
-
-  for (const file of managedFiles) {
-    await copyFile(resolve(sourceDir, file), resolve(installDir, file));
-  }
-
-  await writeFile(resolve(installDir, workspaceMetadataFile), `${projectRoot}\n`, {
+  await writeFile(resolve(installDir, workspaceMetadataFile), `${targetRoot}\n`, {
     encoding: "utf8",
     mode: 0o600,
   });
