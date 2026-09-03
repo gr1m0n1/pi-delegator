@@ -32,7 +32,17 @@ The model is simple:
 
 ```bash
 ./pi-delegator/scripts/install.sh
-./pi-delegator/scripts/check_pi_setup.sh
+./.pi-delegator/scripts/check_pi_setup.sh
+./.pi-delegator/bin/pi-agent
+./.pi-delegator/bin/pi
+```
+
+To install `.pi-delegator/` inside another repository or directory:
+
+```bash
+./pi-delegator/scripts/install.sh --install-dir /path/to/target-repo
+cd /path/to/target-repo
+./.pi-delegator/scripts/check_pi_setup.sh
 ./.pi-delegator/bin/pi-agent
 ./.pi-delegator/bin/pi
 ```
@@ -64,10 +74,10 @@ If no `delegation_set` is specified, `pi-delegator` uses the `default` set autom
 If you also want the installer to configure local MCP clients, use one of these flags:
 
 ```bash
-./pi-delegator/scripts/install.sh --copilot
-./pi-delegator/scripts/install.sh --codex
-./pi-delegator/scripts/install.sh --claude
-./pi-delegator/scripts/install.sh --all-clients
+./.pi-delegator/scripts/install.sh --copilot
+./.pi-delegator/scripts/install.sh --codex
+./.pi-delegator/scripts/install.sh --claude
+./.pi-delegator/scripts/install.sh --all-clients
 ```
 
 This updates:
@@ -86,19 +96,21 @@ This updates:
 6. `./.pi-delegator/bin/pi-mcp` exposes delegation through MCP.
 7. `configure_clients.mjs` can register the local MCP server in Copilot, Codex, and Claude Code when `install.sh` is executed with client flags.
 
+Use `--install-dir DIR` or `--dir DIR` to choose a target repository or directory. The installer creates `DIR/.pi-delegator/`, and the generated MCP wrapper sets `PI_MCP_ALLOWED_ROOT` to `DIR` by default.
+
 ## MCP Timeouts
 
 The local MCP server supports both a global timeout and a per-tool-call timeout:
 
-- `PI_MCP_TIMEOUT_SECONDS`: default timeout for delegated MCP runs. If omitted, it defaults to `0`.
+- `PI_MCP_TIMEOUT_SECONDS`: default timeout for delegated MCP runs. If omitted, it defaults to `7200`.
 - `timeout_seconds`: optional timeout passed in an individual MCP tool call.
 
 Timeout behavior is:
 
-- `0` means no time limit.
-- positive values are measured in seconds.
-- if `PI_MCP_TIMEOUT_SECONDS` is greater than `0`, it acts as the maximum allowed timeout for any individual tool call.
-- if `PI_MCP_TIMEOUT_SECONDS=0`, the global limit is disabled and each tool call may use either `0` or any positive value up to `7200`.
+- timeouts are measured in seconds.
+- valid values are `1` through `7200`.
+- omitted, invalid, or `0` timeout values fall back to `7200`.
+- `PI_MCP_TIMEOUT_SECONDS` acts as the maximum allowed timeout for any individual tool call.
 
 ## Requirements
 
