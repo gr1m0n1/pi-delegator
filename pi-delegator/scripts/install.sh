@@ -8,7 +8,7 @@ if [[ ! -d "${source_root}/scripts" && -d "${project_root}/.pi-delegator/scripts
 fi
 node_version="${PI_NODE_VERSION:-22.22.1}"
 pi_version="${PI_CODING_AGENT_VERSION:-0.84.2}"
-subagents_package="${PI_SUBAGENTS_PACKAGE:-npm:@tintinweb/pi-subagents@0.17.0}"
+subagents_package="${PI_SUBAGENTS_PACKAGE:-npm:pi-subagents@0.65.0}"
 context_mode_package="${PI_CONTEXT_MODE_PACKAGE:-npm:context-mode}"
 pi_lens_package="npm:pi-lens@4.1.3"
 ask_user_package="npm:@juicesharp/rpiv-ask-user-question@2.9.0"

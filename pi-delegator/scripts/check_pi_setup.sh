@@ -64,6 +64,7 @@ check "required Pi packages" node --input-type=module -e '
   const path = `${process.argv[1]}/settings.json`;
   const config = JSON.parse(readFileSync(path, "utf8"));
   const required = [
+    ["npm:pi-subagents@0.65.0", "pi-subagents"],
     ["npm:context-mode", "context-mode"],
     ["npm:pi-lens@4.1.3", "pi-lens"],
     ["npm:@juicesharp/rpiv-ask-user-question@2.9.0", "@juicesharp/rpiv-ask-user-question"],
@@ -74,6 +75,26 @@ check "required Pi packages" node --input-type=module -e '
     || !existsSync(`${process.argv[1]}/npm/node_modules/${module}/package.json`)
   ).map(([entry]) => entry);
   if (missing.length) throw new Error(`missing Pi packages: ${missing.join(", ")}`);
+  if (config?.packages?.some((entry) => String(entry).startsWith("npm:@tintinweb/pi-subagents"))) {
+    throw new Error("legacy @tintinweb/pi-subagents package must be removed");
+  }
+' "$runtime_root"
+check "pi-subagents public exports" node --input-type=module -e '
+  import { createRequire } from "node:module";
+  import { readFileSync } from "node:fs";
+  const require = createRequire(`${process.argv[1]}/npm/package.json`);
+  const packageJson = JSON.parse(readFileSync(`${process.argv[1]}/npm/node_modules/pi-subagents/package.json`, "utf8"));
+  const version = String(packageJson.version || "0.0.0").split(".").map((part) => Number.parseInt(part, 10));
+  if ((version[0] ?? 0) < 0 || ((version[0] ?? 0) === 0 && (version[1] ?? 0) < 65)) {
+    throw new Error(`pi-subagents >=0.65.0 is required; found ${packageJson.version || "unknown"}`);
+  }
+  for (const specifier of ["pi-subagents/delegation", "pi-subagents/preflight", "pi-subagents/background-work", "pi-subagents/control-channel", "pi-subagents/capability-ceiling", "pi-subagents/external-runs"]) {
+    try {
+      require.resolve(specifier);
+    } catch (error) {
+      throw new Error(`missing required pi-subagents export ${specifier}: ${error.message}`);
+    }
+  }
 ' "$runtime_root"
 check "subagent extension policy" node --input-type=module -e '
   import { readFileSync } from "node:fs";
@@ -128,7 +149,7 @@ repoverity_check=(node --input-type=module -e '
     process.exit(1);
   };
   const runtimeRoot = process.argv[1];
-  const config = JSON.parse(readFileSync(`${runtimeRoot}/mcp.json`, "utf8"));
+  const config = JSON.parse(readFileSync(`${runtimeRoot}/.mcp.json`, "utf8"));
   const server = config?.mcpServers?.repoverity;
   if (!server || typeof server.command !== "string") fail("missing mcpServers.repoverity");
   const args = Array.isArray(server.args) ? server.args : [];

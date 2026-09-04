@@ -1,0 +1,9 @@
+{
+  "name": "pi-delegator-workspace",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:mcp-smoke": "PI_MCP_PI_RPC=$(command -v node) PI_MCP_ALLOWED_ROOT=$PWD PI_CODING_AGENT_DIR=$PWD/pi-delegator PI_MCP_RPC_ARGS=test/fixtures/fake-pi-rpc-host.mjs node test/smoke-mcp.mjs"
+  }
+}
