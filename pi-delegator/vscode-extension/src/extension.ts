@@ -10,6 +10,7 @@ type ActivityEvent = {
   agent?: string;
   status?: string;
   duration_ms?: number;
+  subagent_id?: string;
 };
 
 type ActivitySnapshot = {
@@ -136,6 +137,8 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
     const activeBySession = new Map<string, ActivityEvent>();
     for (const entry of entries) {
       if (entry.event === "pixel_agent_session_started" && entry.session_id) activeBySession.set(entry.session_id, entry);
+      if (entry.event === "subagent_async_started" && entry.subagent_id) activeBySession.set(`async:${entry.subagent_id}`, entry);
+      else if (entry.event === "subagent_async_completed" && entry.subagent_id) activeBySession.delete(`async:${entry.subagent_id}`);
       else if ((!entry.event || entry.event === "subagent_interrupted") && entry.session_id) activeBySession.delete(entry.session_id);
     }
     try {
@@ -144,7 +147,11 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
       const activeIds = new Set(Array.isArray(state.active_sessions) ? state.active_sessions : []);
       const updatedAt = Date.parse(String(state.updated_at ?? ""));
       const stateIsStale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > activeSessionStaleMs;
-      for (const sessionId of activeBySession.keys()) if (stateIsStale || !activeIds.has(sessionId)) activeBySession.delete(sessionId);
+      for (const sessionId of [...activeBySession.keys()]) {
+        const entry = activeBySession.get(sessionId);
+        const authoritativeSessionId = sessionId.startsWith("async:") ? entry?.session_id : sessionId;
+        if (!authoritativeSessionId || stateIsStale || !activeIds.has(authoritativeSessionId)) activeBySession.delete(sessionId);
+      }
     } catch {
       // Older runtimes do not yet persist an authoritative active-session file.
     }

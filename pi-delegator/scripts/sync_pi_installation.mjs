@@ -26,7 +26,6 @@ const managedDirectories = [
   "scripts",
   "vscode-extension",
 ];
-const agentProfiles = ["coder", "coder-mcp", "researcher", "researcher-mcp", "tester", "tester-mcp", "reviewer", "reviewer-mcp"];
 const obsoleteDirectories = [
   "benchmarks",
   "docs",
@@ -68,7 +67,6 @@ function configuredRepoVerityServerFromEnv() {
 }
 
 async function configuredRepoVerityServer() {
-  if (/^(0|false|no|off)$/i.test(String(process.env.PI_REPOVERITY_ENABLED ?? "").trim())) return null;
   const fromEnv = configuredRepoVerityServerFromEnv();
   if (fromEnv) return fromEnv;
   const vscodeMcp = await readJsonIfPresent(resolve(targetRoot, ".vscode", "mcp.json"));
@@ -91,22 +89,10 @@ async function writeManagedMcpConfig() {
   };
   const repoverity = await configuredRepoVerityServer();
   if (repoverity) mcpServers.repoverity = repoverity;
-  await rm(resolve(installDir, "mcp.json"), { force: true });
-  await writeFile(resolve(installDir, ".mcp.json"), `${JSON.stringify({ mcpServers }, null, 2)}\n`, {
+  await writeFile(resolve(installDir, "mcp.json"), `${JSON.stringify({ mcpServers }, null, 2)}\n`, {
     encoding: "utf8",
     mode: 0o600,
   });
-}
-
-async function rewriteRuntimeExtensionPaths() {
-  const extensionPath = resolve(installDir, "extensions", "pi-agent-runtime.ts");
-  for (const profile of agentProfiles) {
-    const path = resolve(installDir, "agents", `${profile}.md`);
-    if (!existsSync(path)) continue;
-    const contents = await readFile(path, "utf8");
-    const next = contents.replaceAll(".pi-delegator/extensions/pi-agent-runtime.ts", extensionPath);
-    if (next !== contents) await writeFile(path, next, "utf8");
-  }
 }
 
 function createRuntimeBinFiles() {
@@ -153,7 +139,6 @@ if [[ -f "\$env_file" ]]; then
 fi
 
 export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-\${install_root}}"
-export PI_MCP_CONFIG_PATH="\${PI_MCP_CONFIG_PATH:-\${PI_CODING_AGENT_DIR}/.mcp.json}"
 export PI_MCP_ALLOWED_ROOT="\${PI_MCP_ALLOWED_ROOT:-\${project_root}}"
 workspace_root_file="\${PI_CODING_AGENT_DIR}/${workspaceMetadataFile}"
 export PI_AGENT_LOG_DIR="\${PI_AGENT_LOG_DIR:-\${PI_CODING_AGENT_DIR}/logs}"
@@ -221,7 +206,6 @@ if [[ -f "\$env_file" ]]; then
 fi
 
 export PI_CODING_AGENT_DIR="\${PI_CODING_AGENT_DIR:-\${install_root}}"
-export PI_MCP_CONFIG_PATH="\${PI_MCP_CONFIG_PATH:-\${PI_CODING_AGENT_DIR}/.mcp.json}"
 workspace_root_file="\${PI_CODING_AGENT_DIR}/${workspaceMetadataFile}"
 export PI_MCP_ALLOWED_ROOT="\${PI_MCP_ALLOWED_ROOT:-\${project_root}}"
 export PI_MCP_PI_AGENT="\${PI_MCP_PI_AGENT:-\${PI_CODING_AGENT_DIR}/bin/pi-agent}"
@@ -266,7 +250,6 @@ export async function syncPiInstallation() {
     mode: 0o600,
   });
   await writeManagedMcpConfig();
-  await rewriteRuntimeExtensionPaths();
 
   const binDir = resolve(installDir, "bin");
   await rm(binDir, { recursive: true, force: true });

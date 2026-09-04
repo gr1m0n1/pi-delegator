@@ -53,7 +53,7 @@ check "agent file permissions" bash -c '! find "$1/agents" -type f -perm /022 -p
 check "context-mode CLI" bash -c 'command -v context-mode >/dev/null'
 check "context-mode MCP config" node --input-type=module -e '
   import { readFileSync } from "node:fs";
-  const path = `${process.argv[1]}/.mcp.json`;
+  const path = `${process.argv[1]}/mcp.json`;
   const config = JSON.parse(readFileSync(path, "utf8"));
   if (config?.mcpServers?.["context-mode"]?.command !== "context-mode") {
     throw new Error("missing mcpServers.context-mode.command");
@@ -64,7 +64,6 @@ check "required Pi packages" node --input-type=module -e '
   const path = `${process.argv[1]}/settings.json`;
   const config = JSON.parse(readFileSync(path, "utf8"));
   const required = [
-    ["npm:pi-subagents@0.65.0", "pi-subagents"],
     ["npm:context-mode", "context-mode"],
     ["npm:pi-lens@4.1.3", "pi-lens"],
     ["npm:@juicesharp/rpiv-ask-user-question@2.9.0", "@juicesharp/rpiv-ask-user-question"],
@@ -75,26 +74,6 @@ check "required Pi packages" node --input-type=module -e '
     || !existsSync(`${process.argv[1]}/npm/node_modules/${module}/package.json`)
   ).map(([entry]) => entry);
   if (missing.length) throw new Error(`missing Pi packages: ${missing.join(", ")}`);
-  if (config?.packages?.some((entry) => String(entry).startsWith("npm:@tintinweb/pi-subagents"))) {
-    throw new Error("legacy @tintinweb/pi-subagents package must be removed");
-  }
-' "$runtime_root"
-check "pi-subagents public exports" node --input-type=module -e '
-  import { createRequire } from "node:module";
-  import { readFileSync } from "node:fs";
-  const require = createRequire(`${process.argv[1]}/npm/package.json`);
-  const packageJson = JSON.parse(readFileSync(`${process.argv[1]}/npm/node_modules/pi-subagents/package.json`, "utf8"));
-  const version = String(packageJson.version || "0.0.0").split(".").map((part) => Number.parseInt(part, 10));
-  if ((version[0] ?? 0) < 0 || ((version[0] ?? 0) === 0 && (version[1] ?? 0) < 65)) {
-    throw new Error(`pi-subagents >=0.65.0 is required; found ${packageJson.version || "unknown"}`);
-  }
-  for (const specifier of ["pi-subagents/delegation", "pi-subagents/preflight", "pi-subagents/background-work", "pi-subagents/control-channel", "pi-subagents/capability-ceiling", "pi-subagents/external-runs"]) {
-    try {
-      require.resolve(specifier);
-    } catch (error) {
-      throw new Error(`missing required pi-subagents export ${specifier}: ${error.message}`);
-    }
-  }
 ' "$runtime_root"
 check "subagent extension policy" node --input-type=module -e '
   import { readFileSync } from "node:fs";
@@ -107,8 +86,7 @@ check "subagent extension policy" node --input-type=module -e '
       if (!body.includes("ext:pi-agent-runtime") || !body.includes("ext:pi-lens/lens_diagnostics")) {
         throw new Error(`${name}: missing required extension selector`);
       }
-      const extensionLine = body.match(/^extensions:\s*\[(.*)\]$/m)?.[1] ?? "";
-      if (!extensionLine.includes("pi-agent-runtime") || !extensionLine.includes("pi-lens")) {
+      if (!body.includes("extensions: [pi-agent-runtime, pi-lens")) {
         throw new Error(`${name}: pi-lens is not loaded`);
       }
       const hasQuestionTool = body.includes("ext:rpiv-ask-user-question/ask_user_question");
@@ -121,7 +99,7 @@ check "subagent extension policy" node --input-type=module -e '
       const hasWebAccess = body.includes("ext:pi-web-access/web_search")
         && body.includes("ext:pi-web-access/fetch_content")
         && body.includes("ext:pi-web-access/source_check")
-        && extensionLine.includes("pi-web-access");
+        && body.includes("extensions: [pi-agent-runtime, pi-lens, pi-web-access");
       if (hasWebAccess !== (role === "researcher")) {
         throw new Error(`${name}: web-access role policy mismatch`);
       }
@@ -149,7 +127,7 @@ repoverity_check=(node --input-type=module -e '
     process.exit(1);
   };
   const runtimeRoot = process.argv[1];
-  const config = JSON.parse(readFileSync(`${runtimeRoot}/.mcp.json`, "utf8"));
+  const config = JSON.parse(readFileSync(`${runtimeRoot}/mcp.json`, "utf8"));
   const server = config?.mcpServers?.repoverity;
   if (!server || typeof server.command !== "string") fail("missing mcpServers.repoverity");
   const args = Array.isArray(server.args) ? server.args : [];
@@ -175,9 +153,7 @@ repoverity_check=(node --input-type=module -e '
     fail("RepoVerity token file is not readable");
   }
 ' "$runtime_root")
-if [[ "${PI_REPOVERITY_ENABLED:-1}" =~ ^(0|false|no|off)$ ]]; then
-  printf 'SKIP RepoVerity MCP config (disabled)\n'
-elif [[ "${PI_REPOVERITY_REQUIRED:-0}" =~ ^(1|true|yes|on)$ ]]; then
+if [[ "${PI_REPOVERITY_REQUIRED:-0}" =~ ^(1|true|yes|on)$ ]]; then
   check "RepoVerity MCP config" "${repoverity_check[@]}"
 else
   warn_check "RepoVerity MCP config (optional)" "${repoverity_check[@]}"

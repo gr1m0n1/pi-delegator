@@ -1,7 +1,7 @@
 ---
 description: Tester MCP profile with model selected per delegation set
 tools: write, edit, ctx_batch_execute, ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_fetch_and_index, ctx_stats, ctx_doctor, code_index_status, code_retrieve, code_search_exact, code_find_symbol, code_find_references, code_trace, code_impact, code_get_snippets, ext:pi-agent-runtime, ext:pi-lens/lens_diagnostics
-extensions: [.pi-delegator/extensions/pi-agent-runtime.ts, pi-lens]
+extensions: [pi-agent-runtime, pi-lens]
 max_turns: 20
 prompt_mode: replace
 inherit_context: false

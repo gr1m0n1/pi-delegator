@@ -1,7 +1,7 @@
 ---
 description: Minimal, scoped code implementation
 tools: write, edit, ctx_batch_execute, ctx_execute, ctx_execute_file, ctx_index, ctx_search, ctx_fetch_and_index, ctx_stats, ctx_doctor, code_index_status, code_retrieve, code_search_exact, code_find_symbol, code_find_references, code_trace, code_impact, code_get_snippets, ext:pi-agent-runtime, ext:pi-lens/lens_diagnostics, ext:rpiv-ask-user-question/ask_user_question
-extensions: [.pi-delegator/extensions/pi-agent-runtime.ts, pi-lens, rpiv-ask-user-question]
+extensions: [pi-agent-runtime, pi-lens, rpiv-ask-user-question]
 model: litellm/llm-medium-devel
 thinking: off
 max_turns: 20

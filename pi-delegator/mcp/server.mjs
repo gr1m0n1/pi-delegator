@@ -5,8 +5,6 @@ import { spawn } from "node:child_process";
 import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline";
-import { PiRpcHost } from "./pi-rpc-host.mjs";
-import { capabilityCeiling, resolveWriteScope } from "./write-scope.mjs";
 
 const SERVER_VERSION = "1.0.0";
 const PROTOCOL_VERSION = "2024-11-05";
@@ -28,7 +26,6 @@ const ROLE_PROFILE_KEYS = {
   reviewer: "review",
 };
 const ROLE_AGENT_TYPES = {
-  orchestrator: "delegate",
   researcher: "researcher-mcp",
   coder: "coder-mcp",
   tester: "tester-mcp",
@@ -36,7 +33,6 @@ const ROLE_AGENT_TYPES = {
 };
 const MAX_TIMEOUT_SECONDS = 7200;
 const MAX_ACTIVITY_EVENTS = 100;
-const MAX_WAIT_MS = 7_200_000;
 const ACTIVE_SESSION_STALE_MS = integer(process.env.PI_ACTIVE_SESSION_STALE_MS, 90_000, 10_000, 3_600_000);
 const FALLBACK_DELEGATION_SET = "default";
 const SET_ROLES = ["research", "implement", "tests", "review", "orchestrate"];
@@ -77,8 +73,6 @@ const REPOVERITY_TOOLS = [
   "code_index_status",
 ];
 
-const REPOVERITY_PROBE_TIMEOUT_MS = 3000;
-
 function booleanFlag(value, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   return !/^(0|false|no|off)$/i.test(String(value).trim());
@@ -106,11 +100,6 @@ export function createConfig(env = process.env) {
     runtimeRoot,
     launcher: resolve(env.PI_MCP_PI_AGENT || resolve(runtimeRoot, "bin/pi-agent")),
     launcherArgs: [],
-    rpcLauncher: resolve(env.PI_MCP_PI_RPC || resolve(runtimeRoot, "bin/pi")),
-    rpcArgs: parseArgList(env.PI_MCP_RPC_ARGS, ["--mode", "rpc"]),
-    rpcSessionRoot: resolve(env.PI_MCP_RPC_SESSION_ROOT || resolve(runtimeRoot, "sessions/mcp")),
-    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 10000, 100, 120000),
-    rpcRequestTimeoutMs: integer(env.PI_MCP_RPC_REQUEST_TIMEOUT_MS, MAX_WAIT_MS, 100, MAX_WAIT_MS),
     timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
     delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(runtimeRoot, "delegation-sets.json")),
@@ -118,67 +107,12 @@ export function createConfig(env = process.env) {
     defaultDelegationSet: String(env.PI_DEFAULT_DELEGATION_SET || FALLBACK_DELEGATION_SET).trim() || FALLBACK_DELEGATION_SET,
     availableExternalTools,
     forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
-    strictWriterTools: booleanFlag(env.PI_STRICT_WRITER_TOOLS, false),
-    repoVerityEnabled: booleanFlag(env.PI_REPOVERITY_ENABLED, true),
     repoVerityRequired: booleanFlag(env.PI_REPOVERITY_REQUIRED, false),
-    repoVerityAvailability: "unknown",
   };
-}
-
-const hosts = new WeakMap();
-const activeHosts = new Set();
-
-export function rpcHost(config = createConfig()) {
-  let host = hosts.get(config);
-  if (!host) {
-    host = new PiRpcHost({
-      command: config.rpcLauncher,
-      args: config.rpcArgs,
-      cwd: config.root,
-      env: {
-        PI_CODING_AGENT_DIR: config.runtimeRoot,
-        PI_MCP_ALLOWED_ROOT: config.root,
-        PI_MCP_CONFIG_PATH: resolve(config.runtimeRoot, ".mcp.json"),
-        PI_SUBAGENTS_SESSION_ROOT: config.rpcSessionRoot,
-      },
-      sessionRoot: config.rpcSessionRoot,
-      handshakeTimeoutMs: config.rpcHandshakeTimeoutMs,
-      requestTimeoutMs: config.rpcRequestTimeoutMs,
-    });
-    hosts.set(config, host);
-    activeHosts.add(host);
-  }
-  return host;
-}
-
-export async function shutdownRpcHost(config) {
-  const host = hosts.get(config);
-  if (!host) return;
-  await host.stop();
-  hosts.delete(config);
-  activeHosts.delete(host);
-}
-
-async function shutdownAllRpcHosts() {
-  const stopping = [...activeHosts].map((host) => host.stop().catch(() => undefined));
-  activeHosts.clear();
-  await Promise.all(stopping);
 }
 
 function parseToolList(value) {
   return new Set(String(value || "").split(/[\s,]+/).map((entry) => entry.trim()).filter(Boolean));
-}
-
-function parseArgList(value, fallback = []) {
-  if (value === undefined || value === null || value === "") return fallback;
-  const text = String(value).trim();
-  if (!text) return fallback;
-  if (text.startsWith("[")) {
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string")) throw new Error("PI_MCP_RPC_ARGS must be a JSON string array");
-    return parsed;
-  }
-  return text.split(/[\s,]+/).map((entry) => entry.trim()).filter(Boolean);
 }
 
 function commandExists(command, env = process.env) {
@@ -262,7 +196,7 @@ function contextModePackageConfigured(path) {
 
 function configuredContextModeTools(root, runtimeRoot, env = process.env) {
   const candidates = [
-    resolve(runtimeRoot, ".mcp.json"),
+    resolve(runtimeRoot, "mcp.json"),
     resolve(root, ".pi", "mcp.json"),
   ];
   const settingsCandidates = [
@@ -276,83 +210,11 @@ function configuredContextModeTools(root, runtimeRoot, env = process.env) {
 }
 
 function configuredRepoVerityTools(root, runtimeRoot, env = process.env) {
-  if (!booleanFlag(env.PI_REPOVERITY_ENABLED, true)) return [];
   const candidates = [
-    resolve(runtimeRoot, ".mcp.json"),
+    resolve(runtimeRoot, "mcp.json"),
     resolve(root, ".pi", "mcp.json"),
   ];
   return candidates.some((path) => repoVerityServerConfigured(path, env)) ? REPOVERITY_TOOLS : [];
-}
-
-function configuredRepoVerityServer(config) {
-  if (!config.repoVerityEnabled) return null;
-  const candidates = [resolve(config.runtimeRoot, ".mcp.json"), resolve(config.root, ".pi", "mcp.json")];
-  for (const path of candidates) {
-    const server = mcpServer(path, "repoverity");
-    if (server?.command) return server;
-  }
-  return null;
-}
-
-async function probeRepoVerity(config) {
-  const server = configuredRepoVerityServer(config);
-  if (!server) return { available: false, reason: "not_configured" };
-  return await new Promise((resolveProbe) => {
-    const child = spawn(server.command, Array.isArray(server.args) ? server.args : [], {
-      cwd: typeof server.cwd === "string" && server.cwd ? server.cwd : config.root,
-      env: { ...process.env, ...(server.env && typeof server.env === "object" ? server.env : {}) },
-      stdio: ["pipe", "pipe", "ignore"],
-    });
-    let buffer = "";
-    let settled = false;
-    const finish = (available, reason) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.kill("SIGTERM");
-      resolveProbe({ available, reason });
-    };
-    const timer = setTimeout(() => finish(false, "probe_timeout"), REPOVERITY_PROBE_TIMEOUT_MS);
-    timer.unref();
-    child.on("error", () => finish(false, "spawn_failed"));
-    child.on("exit", () => finish(false, "server_exited"));
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const response = JSON.parse(line);
-          if (response.id === 1) finish(!response.error, response.error ? "initialize_failed" : "available");
-        } catch {
-          finish(false, "invalid_response");
-        }
-      }
-    });
-    child.stdin.write(`${JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: "pi-delegator-probe", version: SERVER_VERSION } },
-    })}\n`);
-  });
-}
-
-export async function refreshRepoVerityAvailability(config) {
-  if (!config.repoVerityEnabled) {
-    config.repoVerityAvailability = "disabled";
-    config.availableExternalTools = new Set([...config.availableExternalTools].filter((tool) => !REPOVERITY_TOOLS.includes(tool)));
-    return config.repoVerityAvailability;
-  }
-  const result = await probeRepoVerity(config);
-  config.repoVerityAvailability = result.available ? "available" : result.reason;
-  if (result.available) {
-    for (const tool of REPOVERITY_TOOLS) config.availableExternalTools.add(tool);
-  } else {
-    for (const tool of REPOVERITY_TOOLS) config.availableExternalTools.delete(tool);
-  }
-  return config.repoVerityAvailability;
 }
 
 function parseJsonFile(path, label) {
@@ -506,7 +368,7 @@ export function repositoryInstructionPreflight(config = createConfig()) {
   const missing = [];
   for (const group of REQUIRED_REPOSITORY_TOOL_GROUPS) {
     const requiredByPolicy = config.forceContextMode && group.name === "context-mode";
-    const optionalWhenUnavailable = group.name === "RepoVerity" && (!config.repoVerityEnabled || !config.repoVerityRequired);
+    const optionalWhenUnavailable = group.name === "RepoVerity" && !config.repoVerityRequired;
     const requiredByInstructions = instructions.text && group.triggers.some((trigger) => trigger.test(instructions.text));
     if (!requiredByPolicy && !requiredByInstructions) continue;
     const missingTools = group.tools.filter((toolName) => !config.availableExternalTools.has(toolName));
@@ -686,134 +548,6 @@ function progressToken(value) {
   return typeof value === "string" || typeof value === "number" ? value : null;
 }
 
-function nativeStatus(status) {
-  if (["completed", "failed", "timed_out", "cancelled", "interrupted", "tool_budget_exhausted", "stopped"].includes(status)) return status;
-  return "failed";
-}
-
-function nativeStatusLabel(status) {
-  const normalized = nativeStatus(status);
-  if (normalized === "completed") return "COMPLETED";
-  if (normalized === "stopped" || normalized === "cancelled" || normalized === "interrupted") return "PARTIAL";
-  return "BLOCKED";
-}
-
-function nativeResultText(result) {
-  if (!result) return "No output returned by Pi.";
-  if (typeof result.text === "string") return result.text;
-  if (result.result?.kind === "text" && typeof result.result.text === "string") return result.result.text;
-  if (result.result?.kind === "structured") return JSON.stringify(result.result.value, null, 2);
-  if (typeof result.output === "string") return result.output;
-  return JSON.stringify(result, null, 2);
-}
-
-function nativeAccounting(role, resolution, terminal) {
-  const status = nativeStatus(terminal?.status);
-  const completed = status === "completed";
-  const usage = terminal?.usage && typeof terminal.usage === "object" ? terminal.usage : {};
-  return {
-    role: ROLE_PROFILE_KEYS[role],
-    set: resolution.set,
-    requested_percentage: resolution.percentage,
-    attempted_units: 1,
-    completed_units: completed ? 1 : 0,
-    failed_units: completed ? 0 : 1,
-    successful_percentage_for_this_unit: completed ? 100 : 0,
-    outcome: status,
-    run_id: terminal?.id ?? terminal?.runId ?? null,
-    model: (terminal?.model ?? resolution.model) || null,
-    requested_reasoning: resolution.requestedReasoning || null,
-    effective_thinking: terminal?.thinking ?? resolution.effectiveThinking,
-    usage,
-    integrated_paths: [],
-  };
-}
-
-function buildNativeTaskContract(role, args, config, resolution, taskId) {
-  const writer = WRITER_ROLES.has(role);
-  const task = cleanText(args.task, "task", true);
-  const scope = cleanText(args.scope, "scope") || "Only the explicitly requested task.";
-  const callerConstraints = cleanText(args.constraints, "constraints");
-  const expected = cleanText(args.expected_output, "expected_output") || "Evidence, files changed, tests, risks, and terminal status.";
-  const allowedPaths = normalizeAllowedPaths(args.allowed_paths, config.root, writer);
-  const constraints = callerConstraints || "Do not commit, push, merge, or perform destructive/system operations.";
-  return [
-    `TASK_ID: ${taskId}`,
-    `ROLE: ${role}`,
-    `OBJECTIVE: ${task}`,
-    `SCOPE: ${scope}`,
-    `CONSTRAINTS: ${constraints}`,
-    `FILES: ${allowedPaths.length ? allowedPaths.join(", ") : "read-only; no files may be modified"}`,
-    writer
-      ? `STRICT WRITE SCOPE: ${allowedPaths.join(", ")}. Stop with BLOCKED if work requires another path.`
-      : "READ-ONLY: no agent may create, edit, move, or delete files.",
-    `EXPECTED_OUTPUT: ${expected}`,
-    "Return concise evidence, terminal status, files changed, tests, and risks.",
-  ].join("\n");
-}
-
-function nativeSpawnParams(role, args, config, resolution, taskId) {
-  const agent = ROLE_AGENT_TYPES[role] || role;
-  const timeoutMs = normalizeTimeoutSeconds(args.timeout_seconds, config.timeoutSeconds) * 1000;
-  const writer = WRITER_ROLES.has(role);
-  const allowedPaths = normalizeAllowedPaths(args.allowed_paths, config.root, writer);
-  if (writer) resolveWriteScope(config.root, allowedPaths);
-  const ceiling = capabilityCeiling(role, allowedPaths, config.availableExternalTools, config.strictWriterTools);
-  if (!ceiling.ok) throw new Error(`Writer preflight failed: ${ceiling.reason}`);
-  return {
-    agent,
-    task: buildNativeTaskContract(role, args, config, resolution, taskId),
-    context: "fresh",
-    async: true,
-    cwd: config.root,
-    ...(resolution.model ? { model: `${resolution.model}:${resolution.effectiveThinking}` } : {}),
-    timeoutMs,
-    toolBudget: { hard: integer(args.tool_budget, 64, 1, 10000) },
-    extensionBindings: {
-      "pi-delegator/1": {
-        mcpTool: ROLE_TO_TOOL[role],
-        delegationSet: resolution.set,
-        taskId,
-        allowedTools: ceiling.tools,
-        allowedPaths: ceiling.allowedPaths,
-        workspaceRoot: config.root,
-        strictWriteScope: config.strictWriterTools,
-      },
-    },
-  };
-}
-
-async function runNativeDelegation(role, args, config, resolution, taskId) {
-  const host = rpcHost(config);
-  const spawned = await host.request("spawn", nativeSpawnParams(role, args, config, resolution, taskId), { restartOnFailure: false });
-  const runId = spawned?.id ?? spawned?.runId;
-  if (!runId) throw new Error("Pi RPC spawn did not return a run id");
-  if (args.background === true) return { spawned, terminal: null };
-  const terminal = await host.request("wait", { id: runId, timeoutMs: nativeSpawnParams(role, args, config, resolution, taskId).timeoutMs }, { restartOnFailure: false });
-  return { spawned, terminal };
-}
-
-function formatNativeDelegation(role, resolution, spawned, terminal) {
-  const result = terminal ?? spawned;
-  const terminalStatus = terminal ? nativeStatusLabel(result.status) : "PARTIAL";
-  const accounting = nativeAccounting(role, resolution, result);
-  const details = [
-    `MCP_TOOL: ${ROLE_TO_TOOL[role]}`,
-    `DELEGATION_SET: ${resolution.set ?? "none"}`,
-    `DELEGATION_PERCENTAGE_TARGET: ${resolution.percentage ?? "unspecified"}`,
-    `MODEL: ${(result?.model ?? resolution.model) || "agent profile default"}`,
-    `REASONING_REQUESTED: ${resolution.requestedReasoning || "unspecified"}`,
-    `THINKING_EFFECTIVE: ${result?.thinking ?? resolution.effectiveThinking}`,
-    `RUN_ID: ${result?.id ?? result?.runId ?? spawned?.id ?? spawned?.runId ?? "unknown"}`,
-    `STATUS: ${terminalStatus}`,
-    "RESULT:",
-    terminal ? nativeResultText(result) : "Pi delegation started in background.",
-    `DELEGATION_ACCOUNTING: ${JSON.stringify(accounting)}`,
-    `STRUCTURED_DETAILS: ${JSON.stringify(result ?? {}, null, 2)}`,
-  ];
-  return { content: [{ type: "text", text: details.join("\n") }], isError: terminal ? nativeStatus(result.status) !== "completed" : false };
-}
-
 function activityLogPath(config) {
   return resolve(process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs"), "pi-agents.jsonl");
 }
@@ -877,17 +611,6 @@ function queueWriter(operation) {
 }
 
 export async function delegate(role, args, config = createConfig(), token = null) {
-  await refreshRepoVerityAvailability(config);
-  const preflight = repositoryInstructionPreflight(config);
-  if (!preflight.ok) return blockedPreflightResult(preflight);
-  const resolution = resolveDelegationOptions(role, args, config);
-  const taskId = makeTaskId(args.task_id);
-  const native = await runNativeDelegation(role, args, config, resolution, taskId);
-  return formatNativeDelegation(role, resolution, native.spawned, native.terminal);
-}
-
-export async function delegateLegacy(role, args, config = createConfig(), token = null) {
-  await refreshRepoVerityAvailability(config);
   const preflight = repositoryInstructionPreflight(config);
   if (!preflight.ok) return blockedPreflightResult(preflight);
   const resolution = resolveDelegationOptions(role, args, config);
@@ -953,8 +676,6 @@ function commonProperties(includePaths) {
       description: "Target percentage of eligible supervisor work to delegate; accounting metadata for this unit.",
     },
     model: { type: "string", description: "Optional configured LiteLLM model alias; overrides the selected set." },
-    background: { type: "boolean", description: "Start the delegation asynchronously and return the run id without waiting for completion." },
-    tool_budget: { type: "integer", minimum: 1, maximum: 10000, description: "Hard maximum tool calls for the native pi-subagents run." },
     reasoning: {
       type: "string",
       enum: [...REASONING_LEVELS],
@@ -987,73 +708,12 @@ function tool(name, description, role, writer = false) {
   };
 }
 
-export function validateToolArguments(definition, args = {}) {
-  if (!definition || typeof definition !== "object") throw new Error("tool definition is required");
-  if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("tool arguments must be an object");
-  const schema = definition.inputSchema;
-  if (!schema || typeof schema !== "object" || schema.type !== "object") return args;
-  const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
-    ? schema.properties
-    : {};
-  const allowed = new Set(Object.keys(properties));
-  const unknown = Object.keys(args).filter((key) => !allowed.has(key));
-  if (schema.additionalProperties === false && unknown.length) {
-    throw new Error(`Unknown properties for ${definition.name}: ${unknown.join(", ")}`);
-  }
-  for (const required of Array.isArray(schema.required) ? schema.required : []) {
-    if (args[required] === undefined || args[required] === null) throw new Error(`${required} is required`);
-  }
-  for (const [key, value] of Object.entries(args)) {
-    const property = properties[key];
-    if (!property || typeof property !== "object" || value === undefined || value === null) continue;
-    if (property.type === "string" && typeof value !== "string") throw new Error(`${key} must be a string`);
-    if (property.type === "boolean" && typeof value !== "boolean") throw new Error(`${key} must be a boolean`);
-    if (property.type === "integer" && (!Number.isInteger(value) || value < property.minimum || value > property.maximum)) {
-      throw new Error(`${key} must be an integer between ${property.minimum} and ${property.maximum}`);
-    }
-    if (property.type === "array") {
-      if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
-      if (Number.isInteger(property.minItems) && value.length < property.minItems) throw new Error(`${key} must contain at least ${property.minItems} item(s)`);
-      if (Number.isInteger(property.maxItems) && value.length > property.maxItems) throw new Error(`${key} must contain at most ${property.maxItems} item(s)`);
-    }
-    if (Array.isArray(property.enum) && !property.enum.includes(value)) throw new Error(`${key} must be one of: ${property.enum.join(", ")}`);
-  }
-  return args;
-}
-
-function runControlTool(name, description, properties, required = []) {
-  return {
-    name,
-    description,
-    inputSchema: { type: "object", additionalProperties: false, properties, required },
-    role: name.replace(/^pi_run_/, "run_"),
-  };
-}
-
 export const TOOL_DEFINITIONS = [
   tool("pi_orchestrate", "Coordinate a multi-phase Pi workflow through specialist agents.", "orchestrator", true),
   tool("pi_research", "Delegate read-only repository research or diagnosis to Pi researcher.", "researcher"),
   tool("pi_implement", "Delegate a bounded implementation to Pi coder. Requires strict relative write paths.", "coder", true),
   tool("pi_tests", "Delegate test execution or bounded test edits to Pi tester. Requires strict relative write paths.", "tester", true),
   tool("pi_review", "Delegate an independent, read-only review to Pi reviewer.", "reviewer"),
-  runControlTool("pi_run_status", "List native Pi runs or inspect one run by id.", {
-    id: { type: "string", description: "Optional opaque run id." },
-  }),
-  runControlTool("pi_run_wait", "Wait for a native Pi run without cancelling it when the wait window expires.", {
-    id: { type: "string", description: "Opaque run id returned by a background delegation." },
-    timeout_ms: { type: "integer", minimum: 1, maximum: MAX_WAIT_MS, description: "Maximum wait window in milliseconds." },
-  }, ["id"]),
-  runControlTool("pi_run_stop", "Stop a native Pi run and report stopped state.", {
-    id: { type: "string", description: "Opaque run id." },
-  }, ["id"]),
-  runControlTool("pi_run_steer", "Send guidance to a live native Pi run.", {
-    id: { type: "string", description: "Opaque run id." },
-    message: { type: "string", description: "Non-empty guidance to deliver or queue." },
-  }, ["id", "message"]),
-  runControlTool("pi_run_resume", "Resume an eligible native Pi run with a follow-up message.", {
-    id: { type: "string", description: "Opaque run id." },
-    message: { type: "string", description: "Non-empty follow-up task." },
-  }, ["id", "message"]),
   {
     name: "pi_delegation_sets",
     description: "List the current Pi delegation sets, role models, reasoning metadata, percentages, and default.",
@@ -1167,8 +827,7 @@ export function delegationSets(config = createConfig()) {
   };
 }
 
-export async function status(config = createConfig()) {
-  await refreshRepoVerityAvailability(config);
+export function status(config = createConfig()) {
   const checks = [];
   for (const [label, path, mode] of [
     ["workspace", config.root, constants.R_OK],
@@ -1192,11 +851,7 @@ export async function status(config = createConfig()) {
         `timeout_seconds: ${config.timeoutSeconds}`,
         `max_output_chars: ${config.maxOutputChars}`,
         `runtime_root: ${config.runtimeRoot}`,
-        `rpc_host_state: ${rpcHost(config).getState()}`,
-        `rpc_session_root: ${config.rpcSessionRoot}`,
         `force_context_mode: ${config.forceContextMode ? "yes" : "no"}`,
-        `repoverity_enabled: ${config.repoVerityEnabled ? "yes" : "no"}`,
-        `repoverity_availability: ${config.repoVerityAvailability}`,
         `repoverity_required: ${config.repoVerityRequired ? "yes" : "no"}`,
         `delegation_sets_file: ${config.delegationSetsFile}`,
         `default_delegation_set: ${config.defaultDelegationSet || "none"}`,
@@ -1208,49 +863,12 @@ export async function status(config = createConfig()) {
   };
 }
 
-function controlArgs(args) {
-  const id = cleanText(args.id, "id");
-  const message = cleanText(args.message, "message");
-  return { id, message, timeoutMs: integer(args.timeout_ms, 60_000, 1, MAX_WAIT_MS) };
-}
-
-async function runControl(role, args, config) {
-  const host = rpcHost(config);
-  const normalized = controlArgs(args);
-  let method;
-  let params;
-  let options = { restartOnFailure: false };
-  if (role === "run_status") {
-    method = "status";
-    params = normalized.id ? { id: normalized.id } : {};
-    options = { idempotent: true };
-  } else if (role === "run_wait") {
-    method = "wait";
-    params = { id: normalized.id, timeoutMs: normalized.timeoutMs };
-  } else if (role === "run_stop") {
-    method = "stop";
-    params = { id: normalized.id };
-  } else if (role === "run_steer") {
-    method = "steer";
-    params = { id: normalized.id, message: normalized.message };
-  } else if (role === "run_resume") {
-    method = "resume";
-    params = { id: normalized.id, message: normalized.message };
-  } else {
-    throw new Error(`Unknown run control role: ${role}`);
-  }
-  const result = await host.request(method, params, options);
-  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }], isError: Boolean(result?.isError) };
-}
-
 export async function callTool(name, args = {}, config = createConfig(), token = null) {
   const definition = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
   if (!definition) throw new Error(`Unknown tool: ${name}`);
-  validateToolArguments(definition, args);
   if (definition.role === "status") return status(config);
   if (definition.role === "sets") return delegationSets(config);
   if (definition.role === "activity") return activity(args, config);
-  if (String(definition.role).startsWith("run_")) return runControl(definition.role, args, config);
   return delegate(definition.role, args, config, progressToken(token));
 }
 
@@ -1296,11 +914,6 @@ async function handleMessage(message, config) {
 
 export function main(config = createConfig()) {
   if (!existsSync(config.root)) throw new Error(`PI_MCP_ALLOWED_ROOT does not exist: ${config.root}`);
-  for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, () => {
-      void shutdownAllRpcHosts().finally(() => process.exit(0));
-    });
-  }
   const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on("line", (line) => {
     if (!line.trim()) return;

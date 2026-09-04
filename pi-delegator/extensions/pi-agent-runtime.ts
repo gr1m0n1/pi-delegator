@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { DelegationPolicy, dangerousCommand } from "./delegation-policy.mjs";
@@ -57,7 +57,6 @@ type McpBridge = {
   serverName: string;
   client: McpStdioClient;
   tools: string[];
-  clientTools: Map<string, McpTool>;
 };
 
 type RuntimeState = {
@@ -83,17 +82,11 @@ const PI_SUBAGENT_START_TIMEOUT_MS = Math.max(60_000, Number.parseInt(process.en
 const PI_ACTIVE_SESSION_HEARTBEAT_MS = Math.max(5_000, Number.parseInt(process.env.PI_ACTIVE_SESSION_HEARTBEAT_MS ?? "15_000", 10) || 15_000);
 const CLAUDE_PROJECTS_ROOT = join(homedir(), ".claude", "projects");
 const PI_RUNTIME_ROOT = resolve(process.env.PI_CODING_AGENT_DIR || join(process.cwd(), ".pi-delegator"));
-const PI_MCP_CONFIG_PATH = resolve(process.env.PI_MCP_CONFIG_PATH || join(PI_RUNTIME_ROOT, ".mcp.json"));
 const PI_SOURCE_ROOT = resolve(
   process.env.PI_DELEGATOR_SOURCE_ROOT
   || (existsSync(join(process.cwd(), "pi-delegator", "agents")) ? join(process.cwd(), "pi-delegator") : PI_RUNTIME_ROOT),
 );
 let cachedPixelAgentsWebSocket: Promise<PixelAgentsWebSocketConstructor | null> | null = null;
-const mcpToolRegistrations = new WeakSet<object>();
-const lifecycleRegistrations = new WeakSet<object>();
-const rpcCommandRegistrations = new WeakSet<object>();
-const DIRECT_WRITE_TOOLS = new Set(["edit", "write"]);
-const INDIRECT_WRITE_TOOLS = new Set(["apply_patch", "bash", "shell", "terminal", "ctx_execute", "ctx_batch_execute"]);
 const shared = ((globalThis as Record<PropertyKey, unknown>)[stateKey] ??= {
   policy: new DelegationPolicy(Number.parseInt(process.env.MAX_SUBAGENT_CALLS ?? "12", 10) || 12),
   registeredLogger: false,
@@ -289,7 +282,7 @@ function isMcpTool(value: unknown): value is McpTool {
 
 function readMcpServers(): Record<string, McpServerConfig> {
   try {
-    const config = JSON.parse(readFileSync(PI_MCP_CONFIG_PATH, "utf8")) as { mcpServers?: unknown; servers?: unknown };
+    const config = JSON.parse(readFileSync(join(PI_RUNTIME_ROOT, "mcp.json"), "utf8")) as { mcpServers?: unknown; servers?: unknown };
     const rawServers = config.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers : config.servers;
     if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return {};
     const servers: Record<string, McpServerConfig> = {};
@@ -308,7 +301,6 @@ function readMcpServers(): Record<string, McpServerConfig> {
     }
     return servers;
   } catch {
-    appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_config_missing", config_path: PI_MCP_CONFIG_PATH, status: "failed" });
     return {};
   }
 }
@@ -325,33 +317,8 @@ function mcpText(result: Record<string, unknown>): string {
   return parts.join("\n");
 }
 
-function registerMcpTools(pi: ExtensionAPI, bridge: McpBridge): void {
-  if (mcpToolRegistrations.has(pi)) return;
-  for (const toolName of bridge.tools) {
-    const tool = bridge.clientTools.get(toolName);
-    if (!tool) continue;
-    pi.registerTool({
-      name: tool.name,
-      label: tool.name,
-      description: tool.description ?? `${bridge.serverName} MCP tool ${tool.name}`,
-      parameters: tool.inputSchema ?? { type: "object", properties: {} },
-      async execute(_toolCallId, params) {
-        const result = await bridge.client.callTool(tool.name, params ?? {});
-        const text = mcpText(result);
-        if (result.isError) throw new Error(text || `${tool.name} returned an MCP error`);
-        return { content: [{ type: "text", text }], details: {} };
-      },
-    });
-  }
-  mcpToolRegistrations.add(pi);
-}
-
 function ensureMcpTools(pi: ExtensionAPI): Promise<void> {
-  if (shared.mcpBridgeReady) {
-    return shared.mcpBridgeReady.then(() => {
-      for (const bridge of shared.mcpBridges) registerMcpTools(pi, bridge);
-    });
-  }
+  if (shared.mcpBridgeReady) return shared.mcpBridgeReady;
   shared.mcpBridgeReady = (async () => {
     const servers = readMcpServers();
     for (const [serverName, config] of Object.entries(servers)) {
@@ -359,9 +326,21 @@ function ensureMcpTools(pi: ExtensionAPI): Promise<void> {
       try {
         await client.initialize();
         const tools = await client.listTools();
-        const bridge: McpBridge = { serverName, client, tools: tools.map((tool) => tool.name), clientTools: new Map(tools.map((tool) => [tool.name, tool])) };
-        shared.mcpBridges.push(bridge);
-        registerMcpTools(pi, bridge);
+        for (const tool of tools) {
+          pi.registerTool({
+            name: tool.name,
+            label: tool.name,
+            description: tool.description ?? `${serverName} MCP tool ${tool.name}`,
+            parameters: tool.inputSchema ?? { type: "object", properties: {} },
+            async execute(_toolCallId, params) {
+              const result = await client.callTool(tool.name, params ?? {});
+              const text = mcpText(result);
+              if (result.isError) throw new Error(text || `${tool.name} returned an MCP error`);
+              return { content: [{ type: "text", text }], details: {} };
+            },
+          });
+        }
+        shared.mcpBridges.push({ serverName, client, tools: tools.map((tool) => tool.name) });
         appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_registered", server: serverName, tools: tools.map((tool) => tool.name), status: "registered" });
       } catch (error) {
         client.shutdown();
@@ -376,153 +355,6 @@ function shutdownMcpBridges(): void {
   for (const bridge of shared.mcpBridges) bridge.client.shutdown();
   shared.mcpBridges = [];
   shared.mcpBridgeReady = null;
-}
-
-type SubagentRpcReply = {
-  version: 1;
-  requestId: string;
-  success: boolean;
-  data?: unknown;
-  error?: { message?: string };
-};
-
-function callSubagentRpc(pi: ExtensionAPI, method: string, params: unknown, timeoutMs = 60_000): Promise<unknown> {
-  const requestId = randomUUID();
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let unsubscribe: (() => void) | undefined;
-    const timer = setTimeout(() => finish(new Error(`pi-subagents RPC ${method} timed out`)), timeoutMs);
-    const finish = (error?: Error, value?: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      unsubscribe?.();
-      if (error) reject(error);
-      else resolve(value);
-    };
-    timer.unref();
-    unsubscribe = pi.events.on(`subagents:rpc:v1:reply:${requestId}`, (value: unknown) => {
-      const reply = value as SubagentRpcReply;
-      if (!reply || reply.version !== 1 || reply.requestId !== requestId) return;
-      if (!reply.success) finish(new Error(reply.error?.message || `pi-subagents RPC ${method} failed`));
-      else finish(undefined, reply.data);
-    });
-    pi.events.emit("subagents:rpc:v1:request", { version: 1, requestId, method, params, source: { extension: "pi-delegator" } });
-  });
-}
-
-const TERMINAL_RUN_STATES = new Set(["complete", "completed", "failed", "partial", "paused", "stopped", "rejected", "detached"]);
-
-function terminalRunFromStatus(value: unknown, id: string): Record<string, unknown> | null {
-  if (!value || typeof value !== "object") return null;
-  const status = value as Record<string, unknown>;
-  const runs = (status.asyncSnapshot as Record<string, unknown> | undefined)?.runs;
-  if (!Array.isArray(runs)) return null;
-  const run = runs.find((entry) => entry && typeof entry === "object" && String((entry as Record<string, unknown>).id ?? "") === id) as Record<string, unknown> | undefined;
-  if (!run || !TERMINAL_RUN_STATES.has(String(run.state ?? run.status ?? ""))) return null;
-  return { ...run, id, runId: id, status: run.state === "complete" ? "completed" : run.state ?? run.status };
-}
-
-function waitForSubagentRun(pi: ExtensionAPI, params: Record<string, unknown>): Promise<unknown> {
-  const id = String(params.id ?? params.runId ?? "").trim();
-  if (!id) return Promise.reject(new Error("wait requires a run id"));
-  const timeoutMs = Math.max(1, Math.min(7_200_000, Number(params.timeoutMs) || 60_000));
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let lastStatus: unknown;
-    const finish = (value: unknown, error?: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      unsubscribe();
-      if (error) reject(error);
-      else resolve(value);
-    };
-    const unsubscribe = pi.events.on("subagent:async-complete", (value: unknown) => {
-      const event = value && typeof value === "object" ? value as Record<string, unknown> : {};
-      if (String(event.runId ?? event.id ?? "") !== id) return;
-      finish({ ...event, id, runId: id, status: event.status ?? (event.state === "complete" ? "completed" : event.state) });
-    });
-    const timer = setTimeout(() => finish({ id, runId: id, status: "running", waitExpired: true, snapshot: lastStatus }), timeoutMs);
-    timer.unref();
-    void callSubagentRpc(pi, "status", { id }, Math.min(timeoutMs, 60_000)).then((status) => {
-      lastStatus = status;
-      const terminal = terminalRunFromStatus(status, id);
-      if (terminal) finish(terminal);
-    }, (error) => finish(undefined, error));
-  });
-}
-
-function registerNativeRpcCommand(pi: ExtensionAPI): void {
-  if (rpcCommandRegistrations.has(pi)) return;
-  rpcCommandRegistrations.add(pi);
-  pi.registerCommand("pi-delegator-rpc", {
-    description: "Internal structured RPC bridge for pi-delegator.",
-    async handler(args, ctx) {
-      let requestId = "unknown";
-      try {
-        if (args.length > 1_000_000) throw new Error("pi-delegator RPC request is too large");
-        const request = JSON.parse(Buffer.from(args.trim(), "base64url").toString("utf8")) as Record<string, unknown>;
-        requestId = String(request.requestId ?? "");
-        const method = String(request.method ?? "");
-        if (!requestId || !method) throw new Error("invalid pi-delegator RPC request");
-        const params = request.params && typeof request.params === "object" ? request.params as Record<string, unknown> : {};
-        const data = method === "wait" ? await waitForSubagentRun(pi, params) : await callSubagentRpc(pi, method, params);
-        const payload = Buffer.from(JSON.stringify({ requestId, success: true, data }), "utf8").toString("base64url");
-        ctx.ui.notify(`PI_DELEGATOR_RPC:${payload}`, "info");
-      } catch (error) {
-        const payload = Buffer.from(JSON.stringify({ requestId, success: false, error: error instanceof Error ? error.message : String(error) }), "utf8").toString("base64url");
-        ctx.ui.notify(`PI_DELEGATOR_RPC:${payload}`, "error");
-      }
-    },
-  });
-}
-
-type ScopedRuntimeBinding = { root: string; allowedPaths: string[]; strict: boolean; invalidReason?: string };
-
-function scopedRuntimeBinding(): ScopedRuntimeBinding | null {
-  const encoded = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
-  if (!encoded) return null;
-  try {
-    const bindings = JSON.parse(encoded) as Record<string, unknown>;
-    const value = bindings["pi-delegator/1"] as Record<string, unknown> | undefined;
-    if (!value) return null;
-    if (typeof value.workspaceRoot !== "string" || !Array.isArray(value.allowedPaths)) {
-      return { root: "", allowedPaths: [], strict: true, invalidReason: "pi-delegator write-scope binding is malformed" };
-    }
-    if (value.allowedPaths.some((entry) => typeof entry !== "string" || isAbsolute(entry))) {
-      return { root: "", allowedPaths: [], strict: true, invalidReason: "pi-delegator allowedPaths binding is malformed" };
-    }
-    const allowedPaths = value.allowedPaths as string[];
-    return { root: realpathSync(value.workspaceRoot), allowedPaths, strict: value.strictWriteScope === true };
-  } catch (error) {
-    return { root: "", allowedPaths: [], strict: true, invalidReason: `pi-delegator write-scope binding is invalid: ${error instanceof Error ? error.message : String(error)}` };
-  }
-}
-
-function existingPathOrParent(path: string): string {
-  if (existsSync(path)) return realpathSync(path);
-  const parent = dirname(path);
-  return parent === path ? realpathSync(parent) : existingPathOrParent(parent);
-}
-
-function isInside(parent: string, child: string): boolean {
-  const path = relative(parent, child);
-  return path === "" || (!path.startsWith("..") && !isAbsolute(path));
-}
-
-function scopedWriteBlockReason(toolName: string, input: Record<string, unknown>): string | null {
-  const binding = scopedRuntimeBinding();
-  if (!binding) return null;
-  if (binding.invalidReason && (DIRECT_WRITE_TOOLS.has(toolName) || INDIRECT_WRITE_TOOLS.has(toolName))) return binding.invalidReason;
-  if (binding.strict && INDIRECT_WRITE_TOOLS.has(toolName)) return `${toolName} is blocked by strict write-scope policy`;
-  if (!DIRECT_WRITE_TOOLS.has(toolName)) return null;
-  const target = input.path ?? input.filePath;
-  if (typeof target !== "string" || !target.trim()) return `${toolName} requires a path under allowed_paths`;
-  const absolute = resolve(binding.root, target);
-  if (!isInside(binding.root, existingPathOrParent(absolute))) return `write target escapes workspace: ${target}`;
-  const allowed = binding.allowedPaths.some((entry) => isInside(resolve(binding.root, entry), absolute));
-  return allowed ? null : `write target is outside allowed_paths: ${target}`;
 }
 
 function appendAgentStdout(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stdout: unknown }): void {
@@ -1170,11 +1002,8 @@ function clearRuntimeState(reason: string): void {
 }
 
 export default function piAgentRuntime(pi: ExtensionAPI) {
-  registerNativeRpcCommand(pi);
   if (!shared.registeredMcpBridge) {
-    pi.on("session_start", async () => {
-      await ensureMcpTools(pi);
-    });
+    shared.registeredMcpBridge = true;
     pi.on("before_agent_start", async () => {
       await ensureMcpTools(pi);
     });
@@ -1185,8 +1014,6 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
   }
 
   pi.on("tool_call", async (event) => {
-    const scopeBlock = scopedWriteBlockReason(event.toolName, event.input as Record<string, unknown>);
-    if (scopeBlock) return { block: true, reason: scopeBlock };
     if (event.toolName === "Agent") {
       const input = event.input as Record<string, unknown>;
       const prompt = String(input.prompt ?? "");
@@ -1247,16 +1074,13 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
     return undefined;
   });
 
-  if (!shared.registeredLogger) {
-    shared.registeredLogger = true;
-    registerCleanupHandlers();
-    const heartbeat = setInterval(() => {
-      if (shared.activeSessions.size > 0) persistActivePixelAgentSessions();
-    }, PI_ACTIVE_SESSION_HEARTBEAT_MS);
-    heartbeat.unref();
-  }
-  if (lifecycleRegistrations.has(pi)) return;
-  lifecycleRegistrations.add(pi);
+  if (shared.registeredLogger) return;
+  shared.registeredLogger = true;
+  registerCleanupHandlers();
+  const heartbeat = setInterval(() => {
+    if (shared.activeSessions.size > 0) persistActivePixelAgentSessions();
+  }, PI_ACTIVE_SESSION_HEARTBEAT_MS);
+  heartbeat.unref();
 
   pi.events.on("subagents:started", async (event: { id: string; type: string }) => {
     shared.started.set(event.id, Date.now());
