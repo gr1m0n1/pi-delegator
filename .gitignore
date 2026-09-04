@@ -7,3 +7,10 @@
 # Generated logs
 logs/pi-agents.jsonl
 
+# VS Code extension build artifacts
+pi-delegator/vscode-extension/node_modules/
+pi-delegator/vscode-extension/out/
+pi-delegator/vscode-extension/*.vsix
+
+.codex/
+.vscode/

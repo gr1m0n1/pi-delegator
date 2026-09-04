@@ -14,6 +14,7 @@ if [[ -f "$env_file" ]]; then
   source "$env_file"
   set +a
 fi
+target_root="${PI_MCP_ALLOWED_ROOT:-${project_root}}"
 
 nvm_script="${NVM_DIR:-${HOME}/.nvm}/nvm.sh"
 if [[ -s "$nvm_script" ]]; then
@@ -22,7 +23,7 @@ if [[ -s "$nvm_script" ]]; then
   nvm use "${PI_NODE_VERSION:-22.22.1}" >/dev/null
 fi
 
-timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${project_root}" node "${source_root}/scripts/sync_pi_installation.mjs"
+timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${target_root}" node "${source_root}/scripts/sync_pi_installation.mjs"
 
 errors=0
 check() {
@@ -36,13 +37,134 @@ check() {
   fi
 }
 
+warn_check() {
+  local label="$1"
+  shift
+  if timeout 30s "$@"; then
+    printf 'OK   %s\n' "$label"
+  else
+    printf 'WARN %s\n' "$label" >&2
+  fi
+}
+
 check "Pi installed" pi --version
 check "Node compatible" node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 22 ? 0 : 1)'
 check "agent file permissions" bash -c '! find "$1/agents" -type f -perm /022 -print -quit | grep -q .' _ "$source_root"
+check "context-mode CLI" bash -c 'command -v context-mode >/dev/null'
+check "context-mode MCP config" node --input-type=module -e '
+  import { readFileSync } from "node:fs";
+  const path = `${process.argv[1]}/.mcp.json`;
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  if (config?.mcpServers?.["context-mode"]?.command !== "context-mode") {
+    throw new Error("missing mcpServers.context-mode.command");
+  }
+' "$runtime_root"
+check "required Pi packages" node --input-type=module -e '
+  import { existsSync, readFileSync } from "node:fs";
+  const path = `${process.argv[1]}/settings.json`;
+  const config = JSON.parse(readFileSync(path, "utf8"));
+  const required = [
+    ["npm:context-mode", "context-mode"],
+    ["npm:pi-lens@4.1.3", "pi-lens"],
+    ["npm:@juicesharp/rpiv-ask-user-question@2.9.0", "@juicesharp/rpiv-ask-user-question"],
+    ["npm:pi-web-access@0.27.0", "pi-web-access"],
+  ];
+  const missing = required.filter(([entry, module]) =>
+    !config?.packages?.includes(entry)
+    || !existsSync(`${process.argv[1]}/npm/node_modules/${module}/package.json`)
+  ).map(([entry]) => entry);
+  if (missing.length) throw new Error(`missing Pi packages: ${missing.join(", ")}`);
+' "$runtime_root"
+check "subagent extension policy" node --input-type=module -e '
+  import { readFileSync } from "node:fs";
+  const agentDir = `${process.argv[1]}/agents`;
+  const diagnosticRoles = new Set(["coder", "tester", "reviewer"]);
+  for (const role of ["coder", "researcher", "tester", "reviewer"]) {
+    for (const suffix of ["", "-mcp"]) {
+      const name = `${role}${suffix}`;
+      const body = readFileSync(`${agentDir}/${name}.md`, "utf8");
+      if (!body.includes("ext:pi-agent-runtime") || !body.includes("ext:pi-lens/lens_diagnostics")) {
+        throw new Error(`${name}: missing required extension selector`);
+      }
+      const extensionLine = body.match(/^extensions:\s*\[(.*)\]$/m)?.[1] ?? "";
+      if (!extensionLine.includes("pi-agent-runtime") || !extensionLine.includes("pi-lens")) {
+        throw new Error(`${name}: pi-lens is not loaded`);
+      }
+      const hasQuestionTool = body.includes("ext:rpiv-ask-user-question/ask_user_question");
+      if (hasQuestionTool === Boolean(suffix)) {
+        throw new Error(`${name}: structured-question UI policy mismatch`);
+      }
+      if (diagnosticRoles.has(role) && !body.includes("`lens_diagnostics` with `mode=all`")) {
+        throw new Error(`${name}: missing mandatory final diagnostics`);
+      }
+      const hasWebAccess = body.includes("ext:pi-web-access/web_search")
+        && body.includes("ext:pi-web-access/fetch_content")
+        && body.includes("ext:pi-web-access/source_check")
+        && extensionLine.includes("pi-web-access");
+      if (hasWebAccess !== (role === "researcher")) {
+        throw new Error(`${name}: web-access role policy mismatch`);
+      }
+    }
+  }
+' "$runtime_root"
+check "web access hardening" node --input-type=module -e '
+  import { readFileSync } from "node:fs";
+  const config = JSON.parse(readFileSync(`${process.argv[1]}/web-search.json`, "utf8"));
+  if (config.provider !== "duckduckgo") throw new Error("web search provider must be explicit duckduckgo");
+  if (config.allowBrowserCookies !== false) throw new Error("browser cookies must be disabled");
+  if (config.fetchRouting?.allowRemoteHostedProviders !== false
+    || JSON.stringify(config.fetchRouting?.providers) !== JSON.stringify(["http"])) {
+    throw new Error("fetch routing must be direct HTTP only");
+  }
+  for (const feature of ["githubClone", "githubPrIssue", "youtube", "video"]) {
+    if (config[feature]?.enabled !== false) throw new Error(`${feature} must be disabled`);
+  }
+' "$runtime_root"
+repoverity_check=(node --input-type=module -e '
+  import { accessSync, constants, readFileSync } from "node:fs";
+  import { delimiter, isAbsolute, resolve } from "node:path";
+  const fail = (message) => {
+    console.error(message);
+    process.exit(1);
+  };
+  const runtimeRoot = process.argv[1];
+  const config = JSON.parse(readFileSync(`${runtimeRoot}/mcp.json`, "utf8"));
+  const server = config?.mcpServers?.repoverity;
+  if (!server || typeof server.command !== "string") fail("missing mcpServers.repoverity");
+  const args = Array.isArray(server.args) ? server.args : [];
+  const arg = (name) => {
+    const index = args.indexOf(name);
+    return index >= 0 && typeof args[index + 1] === "string" ? args[index + 1] : "";
+  };
+  const tokenFile = arg("--token-file");
+  if (!arg("--repository") || !arg("--remote-url") || !tokenFile) fail("incomplete RepoVerity gateway args");
+  const commandExists = (command) => {
+    const candidates = command.includes("/") || isAbsolute(command)
+      ? [command]
+      : String(process.env.PATH || "").split(delimiter).filter(Boolean).map((entry) => resolve(entry, command));
+    for (const candidate of candidates) {
+      try { accessSync(candidate, constants.R_OK | constants.X_OK); return true; } catch {}
+    }
+    return false;
+  };
+  if (!commandExists(server.command)) fail("RepoVerity gateway command is not executable");
+  try {
+    accessSync(resolve(tokenFile), constants.R_OK);
+  } catch {
+    fail("RepoVerity token file is not readable");
+  }
+' "$runtime_root")
+if [[ "${PI_REPOVERITY_ENABLED:-1}" =~ ^(0|false|no|off)$ ]]; then
+  printf 'SKIP RepoVerity MCP config (disabled)\n'
+elif [[ "${PI_REPOVERITY_REQUIRED:-0}" =~ ^(1|true|yes|on)$ ]]; then
+  check "RepoVerity MCP config" "${repoverity_check[@]}"
+else
+  warn_check "RepoVerity MCP config (optional)" "${repoverity_check[@]}"
+fi
 
 if [[ -n "${LITELLM_BASE_URL:-}" && -n "${LITELLM_API_KEY:-}" ]]; then
   export PI_CODING_AGENT_DIR="${runtime_root}"
-  export PI_MCP_ALLOWED_ROOT="${project_root}"
+  export PI_MCP_ALLOWED_ROOT="${target_root}"
   check "runtime config render" node "${source_root}/scripts/render_pi_config.mjs"
   check "LiteLLM models" node --input-type=module -e '
     const base = process.env.LITELLM_BASE_URL;

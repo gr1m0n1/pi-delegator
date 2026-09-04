@@ -11,7 +11,7 @@
         "supportsUsageInStreaming": true
       },
       "models": [
-        { "id": "llm-large", "name": "LiteLLM large/orchestrator", "reasoning": true, "contextWindow": 131072, "maxTokens": 8192 },
+        { "id": "llm-large", "name": "LiteLLM large/orchestrator", "reasoning": true, "input": ["text", "image"],"contextWindow": 131072, "maxTokens": 8192 },
         { "id": "llm-medium-devel", "name": "LiteLLM coder", "reasoning": false, "contextWindow": 65535, "maxTokens": 8192 },
         { "id": "llm-medium", "name": "LiteLLM researcher/reviewer", "reasoning": false, "contextWindow": 65535, "maxTokens": 8192 },
         { "id": "llm-small", "name": "LiteLLM tester/fast", "reasoning": false, "contextWindow": 65535, "maxTokens": 4096 }

@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -25,6 +26,7 @@ type PendingDelegation = {
   model: string | null;
   transcriptPath: string | null;
   workspaceCwd: string;
+  startTimer: NodeJS.Timeout | null;
 };
 
 type ActiveSession = PendingDelegation & {
@@ -32,14 +34,43 @@ type ActiveSession = PendingDelegation & {
   startedAt: number;
 };
 
+type McpServerConfig = {
+  command: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+};
+
+type McpTool = {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+};
+
+type McpPendingRequest = {
+  resolve(value: unknown): void;
+  reject(error: unknown): void;
+  timer: NodeJS.Timeout | null;
+};
+
+type McpBridge = {
+  serverName: string;
+  client: McpStdioClient;
+  tools: string[];
+  clientTools: Map<string, McpTool>;
+};
+
 type RuntimeState = {
   policy: DelegationPolicy;
   registeredLogger: boolean;
   registeredCleanup: boolean;
+  registeredMcpBridge: boolean;
   started: Map<string, number>;
   pendingDelegations: Map<string, PendingDelegation[]>;
   taskIds: Map<string, string>;
   activeSessions: Map<string, ActiveSession>;
+  mcpBridges: McpBridge[];
+  mcpBridgeReady: Promise<void> | null;
 };
 
 const stateKey = Symbol.for("etc-stack-v3:pi-agent-runtime");
@@ -48,21 +79,28 @@ const PIXEL_AGENTS_CONFIG_PATH = join(homedir(), ".pixel-agents", "server.json")
 const PIXEL_AGENTS_SERVERS_PATH = join(homedir(), ".pixel-agents", "servers");
 const PIXEL_AGENTS_VSCODE_STATE_PATH = join(homedir(), ".pixel-agents", "vscode-state.json");
 const PIXEL_AGENTS_TIMEOUT_MS = Math.max(250, Number.parseInt(process.env.PI_PIXEL_AGENTS_TIMEOUT_MS ?? "2000", 10) || 2000);
+const PI_SUBAGENT_START_TIMEOUT_MS = Math.max(60_000, Number.parseInt(process.env.PI_SUBAGENT_START_TIMEOUT_MS ?? "60_000", 10) || 60_000);
+const PI_ACTIVE_SESSION_HEARTBEAT_MS = Math.max(5_000, Number.parseInt(process.env.PI_ACTIVE_SESSION_HEARTBEAT_MS ?? "15_000", 10) || 15_000);
 const CLAUDE_PROJECTS_ROOT = join(homedir(), ".claude", "projects");
 const PI_RUNTIME_ROOT = resolve(process.env.PI_CODING_AGENT_DIR || join(process.cwd(), ".pi-delegator"));
+const PI_MCP_CONFIG_PATH = resolve(process.env.PI_MCP_CONFIG_PATH || join(PI_RUNTIME_ROOT, ".mcp.json"));
 const PI_SOURCE_ROOT = resolve(
   process.env.PI_DELEGATOR_SOURCE_ROOT
   || (existsSync(join(process.cwd(), "pi-delegator", "agents")) ? join(process.cwd(), "pi-delegator") : PI_RUNTIME_ROOT),
 );
 let cachedPixelAgentsWebSocket: Promise<PixelAgentsWebSocketConstructor | null> | null = null;
+const mcpToolRegistrations = new WeakSet<object>();
 const shared = ((globalThis as Record<PropertyKey, unknown>)[stateKey] ??= {
   policy: new DelegationPolicy(Number.parseInt(process.env.MAX_SUBAGENT_CALLS ?? "12", 10) || 12),
   registeredLogger: false,
   registeredCleanup: false,
+  registeredMcpBridge: false,
   started: new Map<string, number>(),
   pendingDelegations: new Map<string, PendingDelegation[]>(),
   taskIds: new Map<string, string>(),
   activeSessions: new Map<string, ActiveSession>(),
+  mcpBridges: [],
+  mcpBridgeReady: null,
 }) as RuntimeState;
 
 type PixelAgentsWebSocketInstance = {
@@ -108,6 +146,232 @@ function appendLog(payload: Record<string, unknown>): void {
   } catch (error) {
     process.stderr.write(`[pi-agent-runtime] logging warning: ${String(error)}\n`);
   }
+}
+
+class McpStdioClient {
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private buffer = "";
+  private requestId = 0;
+  private pending = new Map<number, McpPendingRequest>();
+  private initialized = false;
+
+  constructor(private readonly serverName: string, private readonly config: McpServerConfig) {}
+
+  start(): void {
+    if (this.child) return;
+    this.child = spawn(this.config.command, this.config.args ?? [], {
+      cwd: this.config.cwd || process.cwd(),
+      env: { ...process.env, ...(this.config.env ?? {}) },
+      stdio: "pipe",
+    });
+    this.child.stdout.on("data", (chunk) => this.onData(chunk));
+    this.child.stderr.on("data", (chunk) => {
+      const text = chunk.toString("utf8").trim();
+      if (text) appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_stderr", server: this.serverName, stderr: text, status: "debug" });
+    });
+    this.child.on("exit", () => this.onExit());
+    this.child.on("error", (error) => this.onExit(error));
+  }
+
+  async initialize(): Promise<void> {
+    if (this.initialized) return;
+    this.start();
+    await this.request("initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: { tools: {} },
+      clientInfo: { name: "pi-delegator-mcp-bridge", version: "1.0" },
+    });
+    this.notify("notifications/initialized", {});
+    this.initialized = true;
+  }
+
+  async listTools(): Promise<McpTool[]> {
+    if (!this.initialized) await this.initialize();
+    const result = await this.request("tools/list", {});
+    const tools = (result as { tools?: unknown })?.tools;
+    return Array.isArray(tools) ? tools.filter(isMcpTool) : [];
+  }
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (!this.initialized) await this.initialize();
+    const result = await this.request("tools/call", { name, arguments: args }, Number.POSITIVE_INFINITY);
+    return result && typeof result === "object" ? result as Record<string, unknown> : {};
+  }
+
+  shutdown(): void {
+    const child = this.child;
+    this.child = null;
+    this.initialized = false;
+    if (!child) return;
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      // best effort
+    }
+  }
+
+  private request(method: string, params: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> {
+    if (!this.child) throw new Error(`${this.serverName} MCP server is not started`);
+    const id = ++this.requestId;
+    return new Promise((resolve, reject) => {
+      const timer = Number.isFinite(timeoutMs)
+        ? setTimeout(() => {
+            this.pending.delete(id);
+            reject(new Error(`${this.serverName} MCP request timeout: ${method}`));
+          }, timeoutMs)
+        : null;
+      this.pending.set(id, { resolve, reject, timer });
+      const frame = `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
+      this.child?.stdin.write(frame, (error) => {
+        if (!error) return;
+        this.rejectPending(id, error);
+      });
+    });
+  }
+
+  private notify(method: string, params: Record<string, unknown>): void {
+    this.child?.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+  }
+
+  private onData(chunk: Buffer): void {
+    this.buffer += chunk.toString("utf8");
+    let newline = this.buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = this.buffer.slice(0, newline).trim();
+      this.buffer = this.buffer.slice(newline + 1);
+      this.handleLine(line);
+      newline = this.buffer.indexOf("\n");
+    }
+  }
+
+  private handleLine(line: string): void {
+    if (!line) return;
+    let message: unknown;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (!message || typeof message !== "object" || typeof (message as { id?: unknown }).id !== "number") return;
+    const id = (message as { id: number }).id;
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    if (pending.timer) clearTimeout(pending.timer);
+    const envelope = message as { error?: unknown; result?: unknown };
+    if (envelope.error) pending.reject(envelope.error);
+    else pending.resolve(envelope.result);
+  }
+
+  private rejectPending(id: number, error: unknown): void {
+    const pending = this.pending.get(id);
+    if (!pending) return;
+    this.pending.delete(id);
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.reject(error);
+  }
+
+  private onExit(error?: unknown): void {
+    const reason = error instanceof Error ? error : new Error(`${this.serverName} MCP server exited`);
+    this.child = null;
+    this.initialized = false;
+    for (const [id] of this.pending) this.rejectPending(id, reason);
+  }
+}
+
+function isMcpTool(value: unknown): value is McpTool {
+  return Boolean(value && typeof value === "object" && typeof (value as { name?: unknown }).name === "string");
+}
+
+function readMcpServers(): Record<string, McpServerConfig> {
+  try {
+    const config = JSON.parse(readFileSync(PI_MCP_CONFIG_PATH, "utf8")) as { mcpServers?: unknown; servers?: unknown };
+    const rawServers = config.mcpServers && typeof config.mcpServers === "object" ? config.mcpServers : config.servers;
+    if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return {};
+    const servers: Record<string, McpServerConfig> = {};
+    for (const [name, raw] of Object.entries(rawServers)) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+      const server = raw as Partial<McpServerConfig>;
+      if (typeof server.command !== "string" || !server.command.trim()) continue;
+      servers[name] = {
+        command: server.command,
+        args: Array.isArray(server.args) ? server.args.map(String) : [],
+        cwd: typeof server.cwd === "string" && server.cwd.trim() ? server.cwd : undefined,
+        env: server.env && typeof server.env === "object" && !Array.isArray(server.env)
+          ? Object.fromEntries(Object.entries(server.env).map(([key, value]) => [key, String(value)]))
+          : undefined,
+      };
+    }
+    return servers;
+  } catch {
+    appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_config_missing", config_path: PI_MCP_CONFIG_PATH, status: "failed" });
+    return {};
+  }
+}
+
+function mcpText(result: Record<string, unknown>): string {
+  const content = result.content;
+  if (!Array.isArray(content)) return JSON.stringify(result);
+  const parts = content.map((item) => {
+    if (item && typeof item === "object" && (item as { type?: unknown }).type === "text") {
+      return String((item as { text?: unknown }).text ?? "");
+    }
+    return JSON.stringify(item);
+  }).filter((part) => part.trim());
+  return parts.join("\n");
+}
+
+function registerMcpTools(pi: ExtensionAPI, bridge: McpBridge): void {
+  if (mcpToolRegistrations.has(pi)) return;
+  for (const toolName of bridge.tools) {
+    const tool = bridge.clientTools.get(toolName);
+    if (!tool) continue;
+    pi.registerTool({
+      name: tool.name,
+      label: tool.name,
+      description: tool.description ?? `${bridge.serverName} MCP tool ${tool.name}`,
+      parameters: tool.inputSchema ?? { type: "object", properties: {} },
+      async execute(_toolCallId, params) {
+        const result = await bridge.client.callTool(tool.name, params ?? {});
+        const text = mcpText(result);
+        if (result.isError) throw new Error(text || `${tool.name} returned an MCP error`);
+        return { content: [{ type: "text", text }], details: {} };
+      },
+    });
+  }
+  mcpToolRegistrations.add(pi);
+}
+
+function ensureMcpTools(pi: ExtensionAPI): Promise<void> {
+  if (shared.mcpBridgeReady) {
+    return shared.mcpBridgeReady.then(() => {
+      for (const bridge of shared.mcpBridges) registerMcpTools(pi, bridge);
+    });
+  }
+  shared.mcpBridgeReady = (async () => {
+    const servers = readMcpServers();
+    for (const [serverName, config] of Object.entries(servers)) {
+      const client = new McpStdioClient(serverName, config);
+      try {
+        await client.initialize();
+        const tools = await client.listTools();
+        const bridge: McpBridge = { serverName, client, tools: tools.map((tool) => tool.name), clientTools: new Map(tools.map((tool) => [tool.name, tool])) };
+        shared.mcpBridges.push(bridge);
+        registerMcpTools(pi, bridge);
+        appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_registered", server: serverName, tools: tools.map((tool) => tool.name), status: "registered" });
+      } catch (error) {
+        client.shutdown();
+        appendLog({ timestamp: new Date().toISOString(), event: "mcp_bridge_failed", server: serverName, error: String(error), status: "failed" });
+      }
+    }
+  })();
+  return shared.mcpBridgeReady;
+}
+
+function shutdownMcpBridges(): void {
+  for (const bridge of shared.mcpBridges) bridge.client.shutdown();
+  shared.mcpBridges = [];
+  shared.mcpBridgeReady = null;
 }
 
 function appendAgentStdout(agent: unknown, payload: { timestamp: string; status: string; taskId: string | null; sessionId: string | null; stdout: unknown }): void {
@@ -333,7 +597,11 @@ function persistActivePixelAgentSessions(): void {
     mkdirSync(dirname(statePath), { recursive: true, mode: 0o700 });
     writeFileSync(
       statePath,
-      `${JSON.stringify({ active_sessions: [...new Set([...shared.activeSessions.values()].map((session) => session.sessionId))].sort() }, null, 2)}\n`,
+      `${JSON.stringify({
+        active_sessions: [...new Set([...shared.activeSessions.values()].map((session) => session.sessionId))].sort(),
+        updated_at: new Date().toISOString(),
+        process_id: process.pid,
+      }, null, 2)}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
   } catch (error) {
@@ -716,7 +984,54 @@ function registerCleanupHandlers(): void {
   });
 }
 
+function clearRuntimeState(reason: string): void {
+  for (const pending of shared.pendingDelegations.values()) {
+    for (const delegation of pending) {
+      if (delegation.startTimer) clearTimeout(delegation.startTimer);
+      appendLog({
+        timestamp: new Date().toISOString(),
+        event: "delegation_start_cancelled",
+        task_id: delegation.taskId,
+        agent: "pending",
+        status: reason,
+      });
+    }
+  }
+  shared.pendingDelegations.clear();
+  for (const [subagentId, session] of shared.activeSessions) {
+    appendLog({
+      timestamp: new Date().toISOString(),
+      event: "subagent_interrupted",
+      subagent_id: subagentId,
+      session_id: session.sessionId,
+      task_id: session.taskId,
+      parent_agent: session.parentAgent,
+      agent: session.agentType,
+      status: "interrupted",
+      reason,
+    });
+    forcePixelAgentCleanupSync(session);
+  }
+  shared.activeSessions.clear();
+  shared.started.clear();
+  shared.taskIds.clear();
+  persistActivePixelAgentSessions();
+}
+
 export default function piAgentRuntime(pi: ExtensionAPI) {
+  if (!shared.registeredMcpBridge) {
+    pi.on("session_start", async () => {
+      await ensureMcpTools(pi);
+    });
+    pi.on("before_agent_start", async () => {
+      await ensureMcpTools(pi);
+    });
+    pi.on("session_shutdown", () => {
+      shutdownMcpBridges();
+      clearRuntimeState("session_shutdown");
+    });
+  }
+
   pi.on("tool_call", async (event) => {
     if (event.toolName === "Agent") {
       const input = event.input as Record<string, unknown>;
@@ -726,7 +1041,7 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
       const delegatedTaskId = /\bTASK_ID:\s*(TASK-[A-Za-z0-9.-]+)/.exec(prompt)?.[1] ?? null;
       const agentType = String(input.subagent_type ?? "");
       const pending = shared.pendingDelegations.get(agentType) ?? [];
-      pending.push({
+      const delegation: PendingDelegation = {
         taskId: delegatedTaskId,
         sessionId: `pi-${agentType.replace(/[^a-zA-Z0-9_-]/g, "-")}-${randomUUID()}`,
         task: taskDescription(prompt),
@@ -734,7 +1049,27 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
         model: typeof input.model === "string" && input.model.trim() ? input.model : modelFor(agentType),
         transcriptPath: null,
         workspaceCwd: pixelAgentsWorkspaceCwd(),
-      });
+        startTimer: null,
+      };
+      delegation.startTimer = setTimeout(() => {
+        const queued = shared.pendingDelegations.get(agentType) ?? [];
+        const next = queued.filter((candidate) => candidate.sessionId !== delegation.sessionId);
+        if (next.length === queued.length) return;
+        shared.pendingDelegations.set(agentType, next);
+        appendLog({
+          timestamp: new Date().toISOString(),
+          event: "delegation_start_timeout",
+          task_id: delegatedTaskId,
+          parent_agent: delegation.parentAgent,
+          agent: agentType || null,
+          session_id: delegation.sessionId,
+          status: "failed",
+          reason: "start_timeout",
+          timeout_ms: PI_SUBAGENT_START_TIMEOUT_MS,
+        });
+      }, PI_SUBAGENT_START_TIMEOUT_MS);
+      delegation.startTimer.unref();
+      pending.push(delegation);
       shared.pendingDelegations.set(agentType, pending);
       appendLog({
         timestamp: new Date().toISOString(),
@@ -761,11 +1096,16 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
   if (shared.registeredLogger) return;
   shared.registeredLogger = true;
   registerCleanupHandlers();
+  const heartbeat = setInterval(() => {
+    if (shared.activeSessions.size > 0) persistActivePixelAgentSessions();
+  }, PI_ACTIVE_SESSION_HEARTBEAT_MS);
+  heartbeat.unref();
 
   pi.events.on("subagents:started", async (event: { id: string; type: string }) => {
     shared.started.set(event.id, Date.now());
     const pending = shared.pendingDelegations.get(event.type) ?? [];
     const delegated = pending.shift();
+    if (delegated?.startTimer) clearTimeout(delegated.startTimer);
     if (delegated?.taskId) shared.taskIds.set(event.id, delegated.taskId);
     shared.pendingDelegations.set(event.type, pending);
     if (!delegated) {
@@ -854,6 +1194,7 @@ export default function piAgentRuntime(pi: ExtensionAPI) {
     appendLog({
       timestamp,
       task_id: resolvedTaskId,
+      session_id: activeSession?.sessionId ?? null,
       parent_agent: "main",
       agent: event.type ?? null,
       model: modelFor(String(event.type ?? "")),

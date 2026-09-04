@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -32,9 +32,51 @@ const ROLE_AGENT_TYPES = {
   reviewer: "reviewer-mcp",
 };
 const MAX_TIMEOUT_SECONDS = 7200;
+const MAX_ACTIVITY_EVENTS = 100;
+const ACTIVE_SESSION_STALE_MS = integer(process.env.PI_ACTIVE_SESSION_STALE_MS, 90_000, 10_000, 3_600_000);
 const FALLBACK_DELEGATION_SET = "default";
 const SET_ROLES = ["research", "implement", "tests", "review", "orchestrate"];
 const REASONING_LEVELS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const REQUIRED_REPOSITORY_TOOL_GROUPS = [
+  {
+    name: "RepoVerity",
+    triggers: [/\bRepoVerity\b/i, /\bcode_index_status\b/],
+    tools: ["code_index_status", "code_retrieve", "code_search_exact"],
+  },
+  {
+    name: "context-mode",
+    triggers: [/\bcontext-mode\b/i, /\bctx_execute\b/, /\bctx_batch_execute\b/],
+    tools: ["ctx_execute", "ctx_batch_execute"],
+  },
+];
+const CONTEXT_MODE_TOOLS = [
+  "ctx_batch_execute",
+  "ctx_execute",
+  "ctx_execute_file",
+  "ctx_index",
+  "ctx_search",
+  "ctx_fetch_and_index",
+  "ctx_stats",
+  "ctx_doctor",
+  "ctx_upgrade",
+  "ctx_purge",
+  "ctx_insight",
+];
+const REPOVERITY_TOOLS = [
+  "code_retrieve",
+  "code_search_exact",
+  "code_find_symbol",
+  "code_find_references",
+  "code_trace",
+  "code_impact",
+  "code_get_snippets",
+  "code_index_status",
+];
+
+function booleanFlag(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  return !/^(0|false|no|off)$/i.test(String(value).trim());
+}
 
 function integer(value, fallback, minimum, maximum) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -50,6 +92,9 @@ function normalizeTimeoutSeconds(value, fallback) {
 export function createConfig(env = process.env) {
   const root = resolve(env.PI_MCP_ALLOWED_ROOT || DEFAULT_ROOT);
   const runtimeRoot = resolve(env.PI_CODING_AGENT_DIR || (existsSync(resolve(root, "bin/pi-agent")) ? root : resolve(root, ".pi-delegator")));
+  const availableExternalTools = parseToolList(env.PI_AVAILABLE_EXTERNAL_TOOLS || env.PI_AVAILABLE_MCP_TOOLS || "");
+  for (const toolName of configuredContextModeTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
+  for (const toolName of configuredRepoVerityTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
   return {
     root,
     runtimeRoot,
@@ -60,7 +105,118 @@ export function createConfig(env = process.env) {
     delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(runtimeRoot, "delegation-sets.json")),
     modelCatalogFile: resolve(env.PI_MODELS_CATALOG_FILE || resolve(runtimeRoot, "models.json.template")),
     defaultDelegationSet: String(env.PI_DEFAULT_DELEGATION_SET || FALLBACK_DELEGATION_SET).trim() || FALLBACK_DELEGATION_SET,
+    availableExternalTools,
+    forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
+    repoVerityEnabled: booleanFlag(env.PI_REPOVERITY_ENABLED, true),
+    repoVerityRequired: booleanFlag(env.PI_REPOVERITY_REQUIRED, false),
   };
+}
+
+function parseToolList(value) {
+  return new Set(String(value || "").split(/[\s,]+/).map((entry) => entry.trim()).filter(Boolean));
+}
+
+function commandExists(command, env = process.env) {
+  if (!command || /[\/]/.test(command)) {
+    try {
+      accessSync(resolve(command), constants.R_OK | constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  for (const entry of String(env.PATH || "").split(delimiter)) {
+    if (!entry) continue;
+    try {
+      accessSync(resolve(entry, command), constants.R_OK | constants.X_OK);
+      return true;
+    } catch {
+      // Keep checking PATH entries.
+    }
+  }
+  return false;
+}
+
+function contextModeServerConfigured(path, env = process.env) {
+  if (!existsSync(path)) return false;
+  let document;
+  try {
+    document = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
+  const servers = document?.mcpServers;
+  const server = servers && typeof servers === "object" && !Array.isArray(servers) ? servers["context-mode"] : null;
+  if (!server || typeof server !== "object" || Array.isArray(server)) return false;
+  const command = typeof server.command === "string" ? server.command.trim() : "";
+  return commandExists(command, env);
+}
+
+function mcpServer(path, name) {
+  if (!existsSync(path)) return null;
+  let document;
+  try {
+    document = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return null;
+  }
+  const servers = document?.mcpServers;
+  const server = servers && typeof servers === "object" && !Array.isArray(servers) ? servers[name] : null;
+  return server && typeof server === "object" && !Array.isArray(server) ? server : null;
+}
+
+function argumentValue(args, flag) {
+  if (!Array.isArray(args)) return "";
+  const index = args.findIndex((entry) => entry === flag);
+  const value = index >= 0 ? args[index + 1] : "";
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function repoVerityServerConfigured(path, env = process.env) {
+  const server = mcpServer(path, "repoverity");
+  if (!server) return false;
+  const command = typeof server.command === "string" ? server.command.trim() : "";
+  const repository = argumentValue(server.args, "--repository");
+  const remoteUrl = argumentValue(server.args, "--remote-url");
+  const tokenFile = argumentValue(server.args, "--token-file");
+  return Boolean(repository && remoteUrl && tokenFile)
+    && commandExists(command, env)
+    && existsSync(resolve(tokenFile));
+}
+
+function contextModePackageConfigured(path) {
+  if (!existsSync(path)) return false;
+  let document;
+  try {
+    document = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
+  return Array.isArray(document?.packages) && document.packages.includes("npm:context-mode");
+}
+
+function configuredContextModeTools(root, runtimeRoot, env = process.env) {
+  const candidates = [
+    resolve(runtimeRoot, ".mcp.json"),
+    resolve(root, ".pi", "mcp.json"),
+  ];
+  const settingsCandidates = [
+    resolve(runtimeRoot, "settings.json"),
+    resolve(root, ".pi", "settings.json"),
+  ];
+  return candidates.some((path) => contextModeServerConfigured(path, env))
+    && settingsCandidates.some((path) => contextModePackageConfigured(path))
+    ? CONTEXT_MODE_TOOLS
+    : [];
+}
+
+function configuredRepoVerityTools(root, runtimeRoot, env = process.env) {
+  if (!booleanFlag(env.PI_REPOVERITY_ENABLED, true)) return [];
+  const candidates = [
+    resolve(runtimeRoot, ".mcp.json"),
+    resolve(root, ".pi", "mcp.json"),
+  ];
+  return candidates.some((path) => repoVerityServerConfigured(path, env)) ? REPOVERITY_TOOLS : [];
 }
 
 function parseJsonFile(path, label) {
@@ -199,6 +355,43 @@ function makeTaskId(value) {
   return `TASK-${stamp}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
+function readRepositoryInstructions(root) {
+  const path = resolve(root, "AGENTS.md");
+  if (!existsSync(path)) return { path, text: "" };
+  try {
+    return { path, text: readFileSync(path, "utf8") };
+  } catch (error) {
+    throw new Error(`Cannot read repository instructions at ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export function repositoryInstructionPreflight(config = createConfig()) {
+  const instructions = readRepositoryInstructions(config.root);
+  const missing = [];
+  for (const group of REQUIRED_REPOSITORY_TOOL_GROUPS) {
+    const requiredByPolicy = config.forceContextMode && group.name === "context-mode";
+    const optionalWhenUnavailable = group.name === "RepoVerity" && (!config.repoVerityEnabled || !config.repoVerityRequired);
+    const requiredByInstructions = instructions.text && group.triggers.some((trigger) => trigger.test(instructions.text));
+    if (!requiredByPolicy && !requiredByInstructions) continue;
+    const missingTools = group.tools.filter((toolName) => !config.availableExternalTools.has(toolName));
+    if (missingTools.length && !optionalWhenUnavailable) missing.push({ name: group.name, tools: missingTools });
+  }
+  return { ok: missing.length === 0, path: instructions.path, missing };
+}
+
+function blockedPreflightResult(preflight) {
+  const lines = [
+    "MCP_TOOL: pi_delegator_preflight",
+    "STATUS: BLOCKED",
+    `REASON: Repository policy or instructions require MCP/tool access that is not declared available to the Pi runtime.`,
+    `INSTRUCTIONS: ${preflight.path}`,
+    "MISSING:",
+    ...preflight.missing.map((group) => `${group.name}: ${group.tools.join(", ")}`),
+    "NEXT_ACTION: Configure those MCP/tool servers for the Pi runtime or set PI_AVAILABLE_EXTERNAL_TOOLS/PI_AVAILABLE_MCP_TOOLS to the exact tool names only after verifying Pi can call them. Set PI_FORCE_CONTEXT_MODE=0 only for an intentional local bypass.",
+  ];
+  return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
+}
+
 export function normalizeAllowedPaths(paths, root, required) {
   if (paths === undefined || paths === null) {
     if (required) throw new Error("allowed_paths is required for this tool");
@@ -228,7 +421,11 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
   const taskId = makeTaskId(args.task_id);
   const task = cleanText(args.task, "task", true);
   const scope = cleanText(args.scope, "scope") || "Only the explicitly requested task.";
-  const constraints = cleanText(args.constraints, "constraints") || "Follow repository instructions; do not commit, push, merge, or perform destructive/system operations.";
+  const repositoryInstructions = "Before any repository inspection, tool selection, test, or edit, read the root AGENTS.md when present and any applicable AGENTS.md files in affected directories; follow those instructions, including MCP/tool usage requirements. Use RepoVerity code_* tools first when available. If RepoVerity is unavailable and not explicitly required by runtime policy, continue with Context Mode. Use Context Mode tools for repository inspection, searches, file reads, command execution, and validation; do not use raw read, grep, find, ls, or bash when an equivalent ctx_* path exists. If required non-optional tools or MCP servers are unavailable, stop with BLOCKED and report what is missing.";
+  const callerConstraints = cleanText(args.constraints, "constraints");
+  const constraints = callerConstraints
+    ? `${repositoryInstructions} ${callerConstraints}`
+    : `${repositoryInstructions} Do not commit, push, merge, or perform destructive/system operations.`;
   const expected = cleanText(args.expected_output, "expected_output") || "Evidence, files changed, tests, risks, and terminal status.";
   const allowedPaths = normalizeAllowedPaths(args.allowed_paths, config.root, writer);
   const dynamicProfile = Boolean(resolution.set || resolution.model || resolution.requestedReasoning);
@@ -287,13 +484,14 @@ export function runPi(prompt, config, requestedTimeoutSeconds, selectedModel = "
   const configuredTimeout = normalizeTimeoutSeconds(config.timeoutSeconds, MAX_TIMEOUT_SECONDS);
   const requestedTimeout = normalizeTimeoutSeconds(requestedTimeoutSeconds, configuredTimeout);
   const timeoutSeconds = Math.min(requestedTimeout, configuredTimeout);
+  const allowedTools = ["Agent", ...config.availableExternalTools].join(",");
   const args = [
     ...config.launcherArgs,
     ...(selectedModel ? ["--model", selectedModel] : []),
     "--no-session",
     "--no-builtin-tools",
     "--tools",
-    "Agent",
+    allowedTools,
     "--print",
     prompt,
   ];
@@ -348,6 +546,64 @@ export function runPi(prompt, config, requestedTimeoutSeconds, selectedModel = "
   });
 }
 
+function progressToken(value) {
+  return typeof value === "string" || typeof value === "number" ? value : null;
+}
+
+function activityLogPath(config) {
+  return resolve(process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs"), "pi-agents.jsonl");
+}
+
+function eventProgressMessage(entry) {
+  const agent = entry.agent || "subagent";
+  if (entry.event === "delegation_requested") return `${agent}: delegation requested`;
+  if (entry.event === "pixel_agent_session_started") return `${agent}: started`;
+  if (entry.event === "delegation_start_timeout") return `${agent}: failed to start before timeout`;
+  if (entry.status) return `${agent}: ${entry.status}`;
+  return `${agent}: activity updated`;
+}
+
+function createProgressReporter(config, taskId, token) {
+  const logPath = activityLogPath(config);
+  let offset = existsSync(logPath) ? statSync(logPath).size : 0;
+  let progress = 0;
+  const publish = (message) => {
+    if (token === null) return;
+    progress += 1;
+    send({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progressToken: token, progress, message },
+    });
+  };
+  const poll = () => {
+    if (!existsSync(logPath)) return;
+    const contents = readFileSync(logPath);
+    if (contents.length < offset) offset = 0;
+    const added = contents.subarray(offset).toString("utf8");
+    offset = contents.length;
+    for (const line of added.split(/\r?\n/)) {
+      if (!line) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry?.task_id === taskId) publish(eventProgressMessage(entry));
+      } catch {
+        // Ignore a partial or malformed log line; later lifecycle events still report progress.
+      }
+    }
+  };
+  const timer = token === null ? null : setInterval(poll, 250);
+  timer?.unref();
+  publish("Pi delegation started");
+  return {
+    stop(outcome) {
+      if (timer) clearInterval(timer);
+      poll();
+      publish(`Pi delegation ${outcome}`);
+    },
+  };
+}
+
 let writerQueue = Promise.resolve();
 
 function queueWriter(operation) {
@@ -356,11 +612,16 @@ function queueWriter(operation) {
   return pending;
 }
 
-export async function delegate(role, args, config = createConfig()) {
+export async function delegate(role, args, config = createConfig(), token = null) {
+  const preflight = repositoryInstructionPreflight(config);
+  if (!preflight.ok) return blockedPreflightResult(preflight);
   const resolution = resolveDelegationOptions(role, args, config);
-  const prompt = buildPrompt(role, args, config, resolution);
+  const taskId = makeTaskId(args.task_id);
+  const prompt = buildPrompt(role, { ...args, task_id: taskId }, config, resolution);
+  const reporter = createProgressReporter(config, taskId, token);
   const operation = () => runPi(prompt, config, args.timeout_seconds, resolution.model);
   const result = WRITER_ROLES.has(role) ? await queueWriter(operation) : await operation();
+  reporter.stop(result.code === 0 ? "finished" : "failed");
   const ok = !result.spawnError && !result.timedOut && result.code === 0;
   const terminalStatus = [...result.stdout.matchAll(/\bSTATUS:\s*(COMPLETED|PARTIAL|BLOCKED)\b/g)].at(-1)?.[1] ?? null;
   const completed = ok && terminalStatus === "COMPLETED";
@@ -467,7 +728,89 @@ export const TOOL_DEFINITIONS = [
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
     role: "status",
   },
+  {
+    name: "pi_activity",
+    description: "Show active Pi subagents and recent lifecycle events inside the current Copilot chat.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        task_id: { type: "string", description: "Optional TASK-* correlation ID." },
+        agent: { type: "string", description: "Optional agent profile, such as coder-mcp or reviewer-mcp." },
+        limit: { type: "integer", minimum: 1, maximum: MAX_ACTIVITY_EVENTS, description: "Maximum recent events to return. Defaults to 20." },
+      },
+    },
+    role: "activity",
+  },
 ];
+
+function activityEntries(config, args) {
+  const logPath = resolve(process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs"), "pi-agents.jsonl");
+  if (!existsSync(logPath)) return { logPath, entries: [] };
+  const taskId = cleanText(args.task_id, "task_id");
+  const agent = cleanText(args.agent, "agent");
+  const entries = readFileSync(logPath, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .flatMap((line) => {
+      try {
+        const entry = JSON.parse(line);
+        return entry && typeof entry === "object" ? [entry] : [];
+      } catch {
+        return [];
+      }
+    })
+    .filter((entry) => !taskId || entry.task_id === taskId)
+    .filter((entry) => !agent || entry.agent === agent);
+  return { logPath, entries };
+}
+
+export function activity(args = {}, config = createConfig()) {
+  const limit = integer(args.limit, 20, 1, MAX_ACTIVITY_EVENTS);
+  const { logPath, entries } = activityEntries(config, args);
+  const activeBySession = new Map();
+  for (const entry of entries) {
+    if (entry.event === "pixel_agent_session_started" && entry.session_id) {
+      activeBySession.set(entry.session_id, entry);
+    } else if (!entry.event || entry.event === "subagent_interrupted") {
+      if (entry.session_id) {
+        activeBySession.delete(entry.session_id);
+        continue;
+      }
+      const legacySession = [...activeBySession.entries()].reverse().find(([, active]) =>
+        active.task_id === entry.task_id && active.agent === entry.agent
+      );
+      if (legacySession) activeBySession.delete(legacySession[0]);
+    }
+  }
+  const activeStatePath = resolve(dirname(logPath), "pixel-agents-active-sessions.json");
+  if (existsSync(activeStatePath)) {
+    try {
+      const state = JSON.parse(readFileSync(activeStatePath, "utf8"));
+      const activeSessionIds = new Set(Array.isArray(state?.active_sessions) ? state.active_sessions : []);
+      const updatedAt = Date.parse(String(state?.updated_at ?? ""));
+      const stateIsStale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > ACTIVE_SESSION_STALE_MS;
+      for (const sessionId of activeBySession.keys()) {
+        if (stateIsStale || !activeSessionIds.has(sessionId)) activeBySession.delete(sessionId);
+      }
+    } catch {
+      // Fall back to lifecycle-event reconciliation when runtime state is unreadable.
+    }
+  }
+  const payload = {
+    log_path: logPath,
+    active_count: activeBySession.size,
+    active_state_stale_after_ms: ACTIVE_SESSION_STALE_MS,
+    active: [...activeBySession.values()].map((entry) => ({
+      session_id: entry.session_id,
+      task_id: entry.task_id ?? null,
+      agent: entry.agent ?? null,
+      started_at: entry.timestamp ?? null,
+    })),
+    recent: entries.slice(-limit),
+  };
+  return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+}
 
 export function delegationSets(config = createConfig()) {
   return {
@@ -510,8 +853,12 @@ export function status(config = createConfig()) {
         `timeout_seconds: ${config.timeoutSeconds}`,
         `max_output_chars: ${config.maxOutputChars}`,
         `runtime_root: ${config.runtimeRoot}`,
+        `force_context_mode: ${config.forceContextMode ? "yes" : "no"}`,
+        `repoverity_enabled: ${config.repoVerityEnabled ? "yes" : "no"}`,
+        `repoverity_required: ${config.repoVerityRequired ? "yes" : "no"}`,
         `delegation_sets_file: ${config.delegationSetsFile}`,
         `default_delegation_set: ${config.defaultDelegationSet || "none"}`,
+        `available_external_tools: ${config.availableExternalTools.size ? [...config.availableExternalTools].sort().join(", ") : "none"}`,
         `tools: ${TOOL_DEFINITIONS.map(({ name }) => name).join(", ")}`,
         "Pi environment may be supplied through process variables instead of .pi-delegator/pi.env.",
       ].join("\n"),
@@ -519,12 +866,13 @@ export function status(config = createConfig()) {
   };
 }
 
-export async function callTool(name, args = {}, config = createConfig()) {
+export async function callTool(name, args = {}, config = createConfig(), token = null) {
   const definition = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
   if (!definition) throw new Error(`Unknown tool: ${name}`);
   if (definition.role === "status") return status(config);
   if (definition.role === "sets") return delegationSets(config);
-  return delegate(definition.role, args, config);
+  if (definition.role === "activity") return activity(args, config);
+  return delegate(definition.role, args, config, progressToken(token));
 }
 
 function send(message) {
@@ -551,7 +899,7 @@ async function handleMessage(message, config) {
         result = { tools: TOOL_DEFINITIONS.map(({ role: _role, ...definition }) => definition) };
         break;
       case "tools/call":
-        result = await callTool(message.params?.name, message.params?.arguments ?? {}, config);
+        result = await callTool(message.params?.name, message.params?.arguments ?? {}, config, message.params?._meta?.progressToken);
         break;
       default:
         send({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
