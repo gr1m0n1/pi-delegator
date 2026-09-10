@@ -141,19 +141,21 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
       else if (entry.event === "subagent_async_completed" && entry.subagent_id) activeBySession.delete(`async:${entry.subagent_id}`);
       else if ((!entry.event || entry.event === "subagent_interrupted") && entry.session_id) activeBySession.delete(entry.session_id);
     }
+    let activeIds: Set<unknown> | undefined;
+    let stateIsStale = true;
     try {
       const statePath = vscode.Uri.joinPath(runtimeRoot, "logs", "pixel-agents-active-sessions.json");
       const state = JSON.parse(readFileSync(statePath.fsPath, "utf8"));
-      const activeIds = new Set(Array.isArray(state.active_sessions) ? state.active_sessions : []);
+      activeIds = new Set(Array.isArray(state.active_sessions) ? state.active_sessions : []);
       const updatedAt = Date.parse(String(state.updated_at ?? ""));
-      const stateIsStale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > activeSessionStaleMs;
-      for (const sessionId of [...activeBySession.keys()]) {
-        const entry = activeBySession.get(sessionId);
-        const authoritativeSessionId = sessionId.startsWith("async:") ? entry?.session_id : sessionId;
-        if (!authoritativeSessionId || stateIsStale || !activeIds.has(authoritativeSessionId)) activeBySession.delete(sessionId);
-      }
+      stateIsStale = !Number.isFinite(updatedAt) || Date.now() - updatedAt > activeSessionStaleMs;
     } catch {
       // Older runtimes do not yet persist an authoritative active-session file.
+    }
+    for (const [key, entry] of [...activeBySession.entries()]) {
+      const sessionId = key.startsWith("async:") ? entry.session_id : key;
+      const observed = activeIds && !stateIsStale && sessionId ? activeIds.has(sessionId) : isRecentEvent(entry);
+      if (!observed) activeBySession.delete(key);
     }
     return { logPath, runtimeRoot, active: [...activeBySession.values()], recent: entries.slice(-50) };
   }
@@ -161,6 +163,11 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
 
 function activityKey(entry: ActivityEvent): string | undefined {
   return entry.task_id && entry.agent ? `${entry.task_id}:${entry.agent}` : undefined;
+}
+
+function isRecentEvent(entry: ActivityEvent): boolean {
+  const timestamp = Date.parse(String(entry.timestamp ?? ""));
+  return Number.isFinite(timestamp) && Date.now() - timestamp <= activeSessionStaleMs;
 }
 
 function isTerminalEvent(entry: ActivityEvent): boolean {

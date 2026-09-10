@@ -6,6 +6,8 @@ import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline";
 
+import { PiRpcHost } from "./pi-rpc-host.mjs";
+
 const SERVER_VERSION = "1.0.0";
 const PROTOCOL_VERSION = "2024-11-05";
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -681,6 +683,7 @@ function commonProperties(includePaths) {
       enum: [...REASONING_LEVELS],
       description: "Requested reasoning level; current Pi LiteLLM models clamp effective thinking to off.",
     },
+    background: { type: "boolean", description: "Run the delegation in the background and return immediately with a run ID." },
   };
   if (includePaths) {
     properties.allowed_paths = {
@@ -739,6 +742,65 @@ export const TOOL_DEFINITIONS = [
       },
     },
     role: "activity",
+  },
+  {
+    name: "pi_run_status",
+    description: "Query the status of delegated runs.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+    role: "run_status",
+  },
+  {
+    name: "pi_run_wait",
+    description: "Wait for a delegated run to complete.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "string", description: "Run ID to wait for." },
+        timeout_ms: { type: "integer", minimum: 1, description: "Maximum wait time in milliseconds." },
+      },
+      required: ["id"],
+    },
+    role: "run_wait",
+  },
+  {
+    name: "pi_run_stop",
+    description: "Stop a running delegation.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: { id: { type: "string", description: "Run ID to stop." } },
+      required: ["id"],
+    },
+    role: "run_stop",
+  },
+  {
+    name: "pi_run_steer",
+    description: "Send a steering message to a running delegation.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "string", description: "Run ID to steer." },
+        message: { type: "string", description: "Steering message." },
+      },
+      required: ["id", "message"],
+    },
+    role: "run_steer",
+  },
+  {
+    name: "pi_run_resume",
+    description: "Resume a stopped delegation.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        id: { type: "string", description: "Run ID to resume." },
+        message: { type: "string", description: "Resume message/context." },
+      },
+      required: ["id", "message"],
+    },
+    role: "run_resume",
   },
 ];
 
@@ -863,13 +925,95 @@ export function status(config = createConfig()) {
   };
 }
 
+const rpcHosts = new Map();
+
+async function getRpcHost(config) {
+  let host = rpcHosts.get(config);
+  if (!host) {
+    host = new PiRpcHost({
+      command: config.rpcLauncher,
+      args: config.rpcArgs ?? [],
+      sessionRoot: config.rpcSessionRoot,
+      handshakeTimeoutMs: config.rpcHandshakeTimeoutMs,
+      requestTimeoutMs: config.rpcRequestTimeoutMs,
+    });
+    rpcHosts.set(config, host);
+  }
+  return host;
+}
+
+export async function shutdownRpcHost(config) {
+  const host = rpcHosts.get(config);
+  if (!host) return;
+  rpcHosts.delete(config);
+  await host.stop();
+}
+
+export function validateToolArguments(definition, args = {}) {
+  const properties = definition.inputSchema?.properties ?? {};
+  const required = definition.inputSchema?.required ?? [];
+  const values = (args && typeof args === "object") ? args : {};
+  const unknown = Object.keys(values).filter((key) => !(key in properties)).sort();
+  if (unknown.length) throw new Error(`Unknown properties for ${definition.name}: ${unknown.join(", ")}`);
+  for (const key of required) {
+    if (values[key] === undefined || values[key] === null) throw new Error(`${key} is required`);
+  }
+  if (
+    values.timeout_seconds !== undefined &&
+    (!Number.isInteger(values.timeout_seconds) || values.timeout_seconds < 1 || values.timeout_seconds > MAX_TIMEOUT_SECONDS)
+  ) {
+    throw new Error(`timeout_seconds must be an integer between 1 and ${MAX_TIMEOUT_SECONDS}`);
+  }
+  if (values.reasoning !== undefined) validateReasoning(values.reasoning);
+  if (values.background !== undefined && typeof values.background !== "boolean") {
+    throw new Error("background must be a boolean");
+  }
+  return values;
+}
+
+const RUN_CONTROL_METHODS = {
+  pi_run_status: "status",
+  pi_run_wait: "wait",
+  pi_run_stop: "stop",
+  pi_run_steer: "steer",
+  pi_run_resume: "resume",
+};
+
 export async function callTool(name, args = {}, config = createConfig(), token = null) {
   const definition = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
   if (!definition) throw new Error(`Unknown tool: ${name}`);
   if (definition.role === "status") return status(config);
   if (definition.role === "sets") return delegationSets(config);
   if (definition.role === "activity") return activity(args, config);
-  return delegate(definition.role, args, config, progressToken(token));
+  validateToolArguments(definition, args);
+  const host = await getRpcHost(config);
+  const controlMethod = RUN_CONTROL_METHODS[name];
+  if (controlMethod) {
+    const params = controlMethod === "status" ? {} : { id: args.id };
+    if (controlMethod === "steer" || controlMethod === "resume") params.message = args.message;
+    if (controlMethod === "wait" && args.timeout_ms !== undefined) params.timeout_ms = args.timeout_ms;
+    const data = await host.request(controlMethod, params);
+    return { content: [{ type: "text", text: JSON.stringify(data) }], isError: false };
+  }
+  void token;
+  const resolution = resolveDelegationOptions(definition.role, args, config);
+  const spawnParams = { model: resolution.model, thinking: resolution.effectiveThinking };
+  if (WRITER_ROLES.has(definition.role)) {
+    const allowedPaths = normalizeAllowedPaths(args.allowed_paths ?? [], config.root, true);
+    if (allowedPaths.length) spawnParams.paths = allowedPaths;
+  }
+  const run = await host.request("spawn", spawnParams);
+  const modelLine = `${resolution.model}:${resolution.effectiveThinking}`;
+  if (args.background === true) {
+    return { content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: PARTIAL` }], isError: false };
+  }
+  const waited = await host.request("wait", { id: run.id });
+  const statusLine = String(waited.status || "completed").toUpperCase();
+  const resultText = waited.result?.text ?? "";
+  return {
+    content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],
+    isError: false,
+  };
 }
 
 function send(message) {
