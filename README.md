@@ -17,7 +17,8 @@ In other words, this repository does not reimplement Pi. It prepares, configures
 - `pi-delegator/`: the project's versioned source
 - `pi-delegator/agents/`: prompts and sub-agent profiles
 - `pi-delegator/extensions/`: runtime hooks and guardrails
-- `pi-delegator/mcp/`: local MCP server
+- `pi-delegator/mcp/`: local MCP server (`server.mjs`) plus the native Pi RPC host client (`pi-rpc-host.mjs`)
+- `test/`: versioned `node:test` suites for the MCP contract, write scope, and the RPC host
 - `pi-delegator/scripts/`: installation, sync, rendering, and verification
 - `.pi-delegator/`: the generated installation and unversioned local state
 
@@ -93,7 +94,7 @@ This updates:
 3. `render_pi_config.mjs` generates `models.json` and `subagents.json` from the local environment.
 4. `check_pi_setup.sh` validates that Pi, Node, and LiteLLM are operational.
 5. `./.pi-delegator/bin/pi-agent` runs the main orchestrator.
-6. `./.pi-delegator/bin/pi-mcp` exposes delegation through MCP.
+6. `./.pi-delegator/bin/pi-mcp` exposes delegation through MCP over a persistent native Pi RPC host.
 7. `configure_clients.mjs` can register the local MCP server in Copilot, Codex, and Claude Code when `install.sh` is executed with client flags.
 
 Use `--install-dir DIR` or `--dir DIR` to choose a target repository or directory. The installer creates `DIR/.pi-delegator/`, and the generated MCP wrapper sets `PI_MCP_ALLOWED_ROOT` to `DIR` by default.
@@ -115,6 +116,27 @@ Timeout behavior is:
 Subagents must emit their started lifecycle event within `PI_SUBAGENT_START_TIMEOUT_MS` (default and minimum `60000`). When this does not happen, Pi records `delegation_start_timeout` with terminal status `failed` and removes the pending delegation instead of leaving it queued indefinitely. On Pi session shutdown, active runtime sessions are recorded as `interrupted` and removed from the active-session state file.
 
 While a subagent is active, Pi refreshes the active-session state every `PI_ACTIVE_SESSION_HEARTBEAT_MS` (default `15000`). `pi_activity` and the VS Code panel expire a state whose last heartbeat is older than `PI_ACTIVE_SESSION_STALE_MS` (default `90000`), so an abrupt process termination cannot leave a permanent active card.
+
+## Native Pi RPC Execution
+
+Delegations no longer spawn an ephemeral Pi process per call. The MCP server keeps one persistent **Pi RPC host** per server process: it starts on demand, performs a `ping` handshake that requires the `status`, `spawn`, `steer`, `stop`, and `resume` capabilities, and is reused for every subsequent request in that workspace.
+
+- Task tools (`pi_orchestrate`, `pi_research`, `pi_implement`, `pi_tests`, `pi_review`) resolve their delegation options (model, reasoning/thinking, percentage) and then issue a native `spawn`. Foreground calls follow up with `wait` inline; passing `background: true` returns immediately with the run ID (`STATUS: PARTIAL`).
+- Run-control tools operate on those stable run IDs:
+  - `pi_run_status`: list current runs.
+  - `pi_run_wait`: block until a run completes (optional `timeout_ms`).
+  - `pi_run_stop`, `pi_run_steer` (`message`), and `pi_run_resume` (`message`) control an in-flight or stopped run. Because the host is persistent, these keep working across MCP tool calls.
+- Idempotent requests such as `status` are retried once after a host crash; non-idempotent failures surface to the caller instead of silently restarting work.
+
+The RPC host process and its sessions are configured through environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `PI_MCP_PI_RPC` | Launcher command for the RPC host. Defaults to the same launcher as delegations (`bin/pi-agent`). Point it at a fixture (for example, `node`) in tests. |
+| `PI_MCP_RPC_ARGS` | Space-separated arguments passed to the RPC host launcher; used by the smoke test to run `test/fixtures/fake-pi-rpc-host.mjs`. |
+| `PI_MCP_RPC_SESSION_ROOT` | Session storage for the host. Defaults to `.pi-delegator/sessions/mcp/`. |
+| `PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS` | Handshake timeout in milliseconds (default `10000`, minimum `500`). |
+| `PI_MCP_RPC_REQUEST_TIMEOUT_SECONDS` | Per-request timeout in seconds; valid values are `1` through `7200`, defaulting to `7200`. |
 
 ## Repository Instruction Preflight
 
@@ -188,6 +210,8 @@ PI SETUP: OK
 - Pixel Agents smoke test against an external install: `node ./pi-delegator/scripts/test_pixel_agents.mjs --launcher /path/to/bin/pi-agent`
 - Clear stale Pixel Agents sessions: `node ./pi-delegator/scripts/clear_pixel_agents_sessions.mjs`
 - Install live VS Code activity view: `./pi-delegator/scripts/install.sh --activity-view`
+- run the test suite (MCP contract, write scope, RPC host): `npm test`
+- end-to-end MCP stdio smoke against the fixture RPC host: `npm run test:mcp-smoke`
 - direct Pi CLI: `./.pi-delegator/bin/pi`
 - main agent: `./.pi-delegator/bin/pi-agent`
 - local MCP server: `./.pi-delegator/bin/pi-mcp`

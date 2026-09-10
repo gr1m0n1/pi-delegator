@@ -97,10 +97,11 @@ export function createConfig(env = process.env) {
   const availableExternalTools = parseToolList(env.PI_AVAILABLE_EXTERNAL_TOOLS || env.PI_AVAILABLE_MCP_TOOLS || "");
   for (const toolName of configuredContextModeTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
   for (const toolName of configuredRepoVerityTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
+  const launcher = resolve(env.PI_MCP_PI_AGENT || resolve(runtimeRoot, "bin/pi-agent"));
   return {
     root,
     runtimeRoot,
-    launcher: resolve(env.PI_MCP_PI_AGENT || resolve(runtimeRoot, "bin/pi-agent")),
+    launcher,
     launcherArgs: [],
     timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
@@ -110,6 +111,11 @@ export function createConfig(env = process.env) {
     availableExternalTools,
     forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
     repoVerityRequired: booleanFlag(env.PI_REPOVERITY_REQUIRED, false),
+    rpcLauncher: env.PI_MCP_PI_RPC ? resolve(env.PI_MCP_PI_RPC) : launcher,
+    rpcArgs: String(env.PI_MCP_RPC_ARGS || "").split(/\s+/).filter(Boolean),
+    rpcSessionRoot: resolve(env.PI_MCP_RPC_SESSION_ROOT || resolve(runtimeRoot, "sessions", "mcp")),
+    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 10_000, 500, 300_000),
+    rpcRequestTimeoutMs: normalizeTimeoutSeconds(env.PI_MCP_RPC_REQUEST_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS) * 1000,
   };
 }
 
