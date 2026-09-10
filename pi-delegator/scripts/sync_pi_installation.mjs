@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { chmod, copyFile, cp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,12 +17,14 @@ const managedFiles = [
   "pi.env.example",
   "settings.json",
   "subagents.json.template",
+  "web-search.json",
 ];
 const managedDirectories = [
   "agents",
   "extensions",
   "mcp",
   "scripts",
+  "vscode-extension",
 ];
 const obsoleteDirectories = [
   "benchmarks",
@@ -31,6 +34,65 @@ const obsoleteDirectories = [
 
 function shellLiteral(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+async function readJsonIfPresent(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function configuredRepoVerityServerFromEnv() {
+  const repository = String(process.env.PI_REPOVERITY_REPOSITORY || "").trim();
+  const remoteUrl = String(process.env.PI_REPOVERITY_REMOTE_URL || "").trim();
+  const tokenFile = String(process.env.PI_REPOVERITY_TOKEN_FILE || "").trim();
+  if (!repository || !remoteUrl || !tokenFile) return null;
+  const command = String(process.env.PI_REPOVERITY_COMMAND || "repoverity-mcp-gateway").trim();
+  const logicalRef = String(process.env.PI_REPOVERITY_LOGICAL_REF || "development").trim();
+  const serverName = String(process.env.PI_REPOVERITY_SERVER_NAME || "repoverity").trim();
+  return {
+    command,
+    args: [
+      "--name", serverName,
+      "--repository", repository,
+      "--logical-ref", logicalRef,
+      "--remote-url", remoteUrl,
+      "--token-file", tokenFile,
+    ],
+    cwd: targetRoot,
+  };
+}
+
+async function configuredRepoVerityServer() {
+  const fromEnv = configuredRepoVerityServerFromEnv();
+  if (fromEnv) return fromEnv;
+  const vscodeMcp = await readJsonIfPresent(resolve(targetRoot, ".vscode", "mcp.json"));
+  const server = vscodeMcp?.servers?.repoverity || vscodeMcp?.mcpServers?.repoverity;
+  if (!server || typeof server !== "object" || Array.isArray(server)) return null;
+  if (typeof server.command !== "string" || !server.command.trim()) return null;
+  return {
+    ...server,
+    cwd: typeof server.cwd === "string" && server.cwd.trim() && server.cwd !== "${workspaceFolder}"
+      ? server.cwd
+      : targetRoot,
+  };
+}
+
+async function writeManagedMcpConfig() {
+  const mcpServers = {
+    "context-mode": {
+      command: "context-mode",
+    },
+  };
+  const repoverity = await configuredRepoVerityServer();
+  if (repoverity) mcpServers.repoverity = repoverity;
+  await writeFile(resolve(installDir, "mcp.json"), `${JSON.stringify({ mcpServers }, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
 }
 
 function createRuntimeBinFiles() {
@@ -172,7 +234,10 @@ export async function syncPiInstallation() {
 
     for (const directory of managedDirectories) {
       await rm(resolve(installDir, directory), { recursive: true, force: true });
-      await cp(resolve(sourceDir, directory), resolve(installDir, directory), { recursive: true });
+      await cp(resolve(sourceDir, directory), resolve(installDir, directory), {
+        recursive: true,
+        filter: (source) => !source.includes("/node_modules/") && !source.endsWith("/node_modules") && !source.includes("/out/") && !source.endsWith("/out"),
+      });
     }
 
     for (const file of managedFiles) {
@@ -184,6 +249,7 @@ export async function syncPiInstallation() {
     encoding: "utf8",
     mode: 0o600,
   });
+  await writeManagedMcpConfig();
 
   const binDir = resolve(installDir, "bin");
   await rm(binDir, { recursive: true, force: true });

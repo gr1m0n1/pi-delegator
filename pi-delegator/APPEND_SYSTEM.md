@@ -12,6 +12,7 @@ PARENT_AGENT: main | coder
 OBJECTIVE:
 SCOPE:
 CONSTRAINTS:
+REPOSITORY_INSTRUCTIONS: Before any repository inspection, tool selection, test, or edit, read the root AGENTS.md when present and any applicable AGENTS.md files in affected directories; follow those instructions, including MCP/tool usage requirements. Use RepoVerity code_* tools first when available. If RepoVerity is unavailable and not explicitly required by runtime policy, continue with Context Mode. Use Context Mode tools for repository inspection, searches, file reads, command execution, and validation; do not use raw read, grep, find, ls, or bash when an equivalent ctx_* path exists. If required non-optional tools or MCP servers are unavailable, stop with BLOCKED and report what is missing.
 FILES:
 DEPENDENCIES:
 EXPECTED_OUTPUT:

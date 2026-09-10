@@ -7,11 +7,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const sourceDir = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const projectRoot = resolve(sourceDir, "..");
+const runtimeRoot = resolve(process.env.PI_CODING_AGENT_DIR || projectRoot);
+const targetRoot = resolve(process.env.PI_MCP_ALLOWED_ROOT || resolve(runtimeRoot, ".."));
 const provider = process.env.PI_PIXEL_AGENTS_PROVIDER || "claude";
 const pixelConfigPath = join(homedir(), ".pixel-agents", "server.json");
 const vscodeStatePath = join(homedir(), ".pixel-agents", "vscode-state.json");
 const claudeProjectsRoot = join(homedir(), ".claude", "projects");
-const workspaceMetadataPath = join(projectRoot, ".pi-delegator", ".pixel-agents-workspace-root");
+const workspaceMetadataPath = join(runtimeRoot, ".pixel-agents-workspace-root");
+const activeSessionsPath = join(runtimeRoot, "logs", "pixel-agents-active-sessions.json");
 
 function workspaceRoot() {
   const explicit = String(process.env.PI_PIXEL_AGENTS_WORKSPACE_CWD || "").trim();
@@ -20,7 +23,7 @@ function workspaceRoot() {
     const value = readFileSync(workspaceMetadataPath, "utf8").split(/\r?\n/, 1)[0]?.trim();
     if (value) return resolve(value);
   }
-  return projectRoot;
+  return targetRoot;
 }
 
 const trackedWorkspaceRoot = workspaceRoot();
@@ -213,6 +216,22 @@ function pruneVscodeState(sessionIds) {
   }
 }
 
+function pruneActiveSessions(sessionIds) {
+  if (!existsSync(activeSessionsPath) || sessionIds.length === 0) return;
+  try {
+    const stale = new Set(sessionIds);
+    const document = JSON.parse(readFileSync(activeSessionsPath, "utf8"));
+    const activeSessions = Array.isArray(document?.active_sessions) ? document.active_sessions : [];
+    const next = activeSessions.filter((sessionId) => !stale.has(sessionId));
+    writeFileSync(activeSessionsPath, `${JSON.stringify({ active_sessions: next }, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  } catch {
+    // Ignore non-critical local state cleanup failures.
+  }
+}
+
 async function settleCleanup(sessionIds) {
   for (const delay of [0, 300, 1200]) {
     if (delay > 0) {
@@ -222,6 +241,7 @@ async function settleCleanup(sessionIds) {
       rmSync(join(projectDir, `${sessionId}.jsonl`), { force: true });
     }
     pruneVscodeState(sessionIds);
+    pruneActiveSessions(sessionIds);
   }
 }
 
@@ -241,7 +261,11 @@ async function main() {
         .map((name) => name.replace(/\.jsonl$/, ""))
         .filter((name) => name.startsWith("pi-"))
     : [];
-  const sessionIds = [...new Set([...transcriptSessionIds, ...stalePiSessionIdsFromVscodeState()])];
+  const activeSessionIds = existsSync(activeSessionsPath)
+    ? JSON.parse(readFileSync(activeSessionsPath, "utf8"))?.active_sessions ?? []
+    : [];
+  const sessionIds = [...new Set([...transcriptSessionIds, ...stalePiSessionIdsFromVscodeState(), ...activeSessionIds])]
+    .filter((sessionId) => typeof sessionId === "string" && sessionId.startsWith("pi-"));
 
   for (const sessionId of sessionIds) {
     const payload = {
@@ -251,7 +275,7 @@ async function main() {
       actor: "claude",
       delegated_to: "pi-cleanup",
       task: "Cleanup stale Pixel Agents session",
-      cwd: projectRoot,
+      cwd: targetRoot,
       source: "pi-cleanup",
     };
     await emit(target, {

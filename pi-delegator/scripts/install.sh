@@ -9,8 +9,13 @@ fi
 node_version="${PI_NODE_VERSION:-22.22.1}"
 pi_version="${PI_CODING_AGENT_VERSION:-0.84.2}"
 subagents_package="${PI_SUBAGENTS_PACKAGE:-npm:@tintinweb/pi-subagents@0.17.0}"
+context_mode_package="${PI_CONTEXT_MODE_PACKAGE:-npm:context-mode}"
+pi_lens_package="npm:pi-lens@4.1.3"
+ask_user_package="npm:@juicesharp/rpiv-ask-user-question@2.9.0"
+web_access_package="npm:pi-web-access@0.27.0"
 env_example="${source_root}/pi.env.example"
 client_flags=()
+activity_view=0
 target_root="${PI_DELEGATOR_TARGET_ROOT:-${project_root}}"
 
 while (($#)); do
@@ -24,9 +29,13 @@ while (($#)); do
       client_flags+=("$1")
       shift
       ;;
+    --activity-view)
+      activity_view=1
+      shift
+      ;;
     --help|-h)
       cat <<'EOF'
-Usage: install.sh [--install-dir DIR] [--copilot] [--codex] [--claude] [--all-clients]
+Usage: install.sh [--install-dir DIR] [--copilot] [--codex] [--claude] [--all-clients] [--activity-view]
 
 Options:
   --install-dir DIR  Install .pi-delegator inside DIR instead of the current repo
@@ -37,6 +46,7 @@ Optional integrations:
   --codex        Update .codex/config.toml
   --claude       Update .mcp.json
   --all-clients  Configure all three
+  --activity-view Build and install the Pi Delegator Activity VS Code extension
 EOF
       exit 0
       ;;
@@ -69,26 +79,51 @@ mkdir -p "${target_root}"
 mkdir -p "${runtime_root}"
 chmod 700 "${runtime_root}"
 
-echo "[3/6] Install Pi coding agent ${pi_version}"
+echo "[3/7] Install Pi coding agent ${pi_version}"
 timeout 180s npm install -g --ignore-scripts "@earendil-works/pi-coding-agent@${pi_version}"
 
-echo "[4/6] Sync source into ${runtime_root}"
+echo "[4/7] Install context-mode CLI"
+timeout 180s npm install -g --ignore-scripts "${context_mode_package#npm:}"
+
+echo "[5/7] Sync source into ${runtime_root}"
 timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${target_root}" node "${source_root}/scripts/sync_pi_installation.mjs"
 
-echo "[5/6] Install Pi subagents package"
-timeout 180s env PI_CODING_AGENT_DIR="${runtime_root}" pi install "${subagents_package}" --approve
+echo "[6/7] Install Pi packages"
+npm_root="${runtime_root}/npm"
+mkdir -p "${npm_root}"
+if [[ ! -f "${npm_root}/package.json" ]]; then
+  printf '%s\n' '{"name":"pi-extensions","private":true}' > "${npm_root}/package.json"
+fi
+timeout 300s npm install --prefix "${npm_root}" --save-exact \
+  "${subagents_package#npm:}" \
+  "${context_mode_package#npm:}" \
+  "${pi_lens_package#npm:}" \
+  "${ask_user_package#npm:}" \
+  "${web_access_package#npm:}"
 
 if [[ ! -f "${env_file}" ]]; then
-  echo "[6/6] Create ${env_file} from example"
+  echo "[7/7] Create ${env_file} from example"
   cp "${env_example}" "${env_file}"
   chmod 600 "${env_file}"
 else
-  echo "[6/6] Keep existing ${env_file}"
+  echo "[7/7] Keep existing ${env_file}"
 fi
 
 if ((${#client_flags[@]})); then
-  echo "[7/7] Configure client integrations"
+  echo "[8/8] Configure client integrations"
   timeout 30s env PI_CODING_AGENT_DIR="${runtime_root}" PI_MCP_ALLOWED_ROOT="${target_root}" node "${source_root}/scripts/configure_clients.mjs" "${client_flags[@]}"
+fi
+
+if ((activity_view)); then
+  echo "[9/9] Install Pi Delegator Activity extension"
+  extension_dir="${source_root}/vscode-extension"
+  timeout 180s npm install --prefix "${extension_dir}"
+  timeout 60s npm run --prefix "${extension_dir}" compile
+  timeout 60s npm run --prefix "${extension_dir}" package
+  extension_file="${extension_dir}/pi-delegator-activity-0.1.0.vsix"
+  code_command="${VSCODE_CLI:-code}"
+  command -v "${code_command}" >/dev/null || { echo "VS Code CLI not found: ${code_command}" >&2; exit 2; }
+  timeout 30s "${code_command}" --install-extension "${extension_file}" --force
 fi
 
 printf -v runtime_root_q '%q' "${runtime_root}"
