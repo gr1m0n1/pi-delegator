@@ -13,6 +13,7 @@ const workspaceMetadataFile = ".pixel-agents-workspace-root";
 const managedFiles = [
   "APPEND_SYSTEM.md",
   "delegation-sets.json",
+  "jev-config.example.json",
   "models.json.template",
   "pi.env.example",
   "settings.json",

@@ -542,7 +542,7 @@ async function callJevProvider(jevConfig, decision, state, allowedValues) {
     questions: { [decision]: question },
   };
   const endpoint = jevConfig.provider.name === "openrouter"
-    ? "https://openrouter.ai/api/v1/alpha/decisions"
+    ? "https://openrouter.ai/api/alpha/decisions"
     : "https://api.typesafe.ai/v1/systemone";
   const response = await fetch(endpoint, {
     method: "POST",
