@@ -1002,8 +1002,52 @@ function clearRuntimeState(reason: string): void {
 }
 
 export default function piAgentRuntime(pi: ExtensionAPI) {
+  pi.registerCommand("pi-delegator-rpc", {
+    description: "Internal RPC bridge for the pi-delegator MCP server",
+    handler: async (encoded, ctx) => {
+      if (ctx.mode !== "rpc") return;
+      let requestId = "unknown";
+      const notify = (payload: Record<string, unknown>) => {
+        ctx.ui.notify(`PI_DELEGATOR_RPC:${Buffer.from(JSON.stringify({ requestId, ...payload }), "utf8").toString("base64url")}`);
+      };
+      try {
+        const request = JSON.parse(Buffer.from(encoded.trim(), "base64url").toString("utf8"));
+        if (!request || typeof request !== "object" || typeof request.requestId !== "string" || typeof request.method !== "string") {
+          throw new Error("Invalid pi-delegator RPC request");
+        }
+        requestId = request.requestId;
+        const reply = await new Promise<Record<string, unknown>>((resolve, reject) => {
+          const eventName = `subagents:rpc:v1:reply:${randomUUID()}`;
+          const packageRequestId = eventName.slice("subagents:rpc:v1:reply:".length);
+          const unsubscribe = pi.events.on(eventName, (value: unknown) => {
+            clearTimeout(timer);
+            unsubscribe?.();
+            resolve(value as Record<string, unknown>);
+          });
+          const timer = setTimeout(() => {
+            unsubscribe?.();
+            reject(new Error(`pi-subagents RPC timed out: ${request.method}`));
+          }, 30_000);
+          pi.events.emit("subagents:rpc:v1:request", {
+            version: 1,
+            requestId: packageRequestId,
+            method: request.method,
+            params: request.params ?? {},
+            source: { extension: "pi-delegator" },
+          });
+        });
+        if (reply.success !== true) throw new Error(String((reply.error as { message?: string } | undefined)?.message ?? "pi-subagents RPC failed"));
+        notify({ success: true, data: reply.data });
+      } catch (error) {
+        notify({ success: false, error: error instanceof Error ? error.message : String(error) });
+      }
+    },
+  });
   if (!shared.registeredMcpBridge) {
     shared.registeredMcpBridge = true;
+    pi.on("session_start", async () => {
+      await ensureMcpTools(pi);
+    });
     pi.on("before_agent_start", async () => {
       await ensureMcpTools(pi);
     });

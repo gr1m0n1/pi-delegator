@@ -83,23 +83,27 @@ check "subagent extension policy" node --input-type=module -e '
     for (const suffix of ["", "-mcp"]) {
       const name = `${role}${suffix}`;
       const body = readFileSync(`${agentDir}/${name}.md`, "utf8");
-      if (!body.includes("ext:pi-agent-runtime") || !body.includes("ext:pi-lens/lens_diagnostics")) {
-        throw new Error(`${name}: missing required extension selector`);
+      const frontmatter = body.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+      const field = (key) => frontmatter.match(new RegExp(`^${key}: (.*)$`, "m"))?.[1]?.split(/,\s*/).filter(Boolean) ?? [];
+      const tools = field("tools");
+      const extensions = field("extensions");
+      if (!tools.includes("lens_diagnostics") || !extensions.includes("../extensions/pi-agent-runtime.ts")
+        || !extensions.includes("../npm/node_modules/context-mode/build/adapters/pi/extension.js")
+        || !extensions.includes("../npm/node_modules/pi-lens/dist/index.js")) {
+        throw new Error(`${name}: missing required child extension or tool`);
       }
-      if (!body.includes("extensions: [pi-agent-runtime, pi-lens")) {
-        throw new Error(`${name}: pi-lens is not loaded`);
-      }
-      const hasQuestionTool = body.includes("ext:rpiv-ask-user-question/ask_user_question");
+      const hasQuestionTool = tools.includes("ask_user_question")
+        && extensions.includes("../npm/node_modules/@juicesharp/rpiv-ask-user-question/index.ts");
       if (hasQuestionTool === Boolean(suffix)) {
         throw new Error(`${name}: structured-question UI policy mismatch`);
       }
       if (diagnosticRoles.has(role) && !body.includes("`lens_diagnostics` with `mode=all`")) {
         throw new Error(`${name}: missing mandatory final diagnostics`);
       }
-      const hasWebAccess = body.includes("ext:pi-web-access/web_search")
-        && body.includes("ext:pi-web-access/fetch_content")
-        && body.includes("ext:pi-web-access/source_check")
-        && body.includes("extensions: [pi-agent-runtime, pi-lens, pi-web-access");
+      const hasWebAccess = tools.includes("web_search")
+        && tools.includes("fetch_content")
+        && tools.includes("source_check")
+        && extensions.includes("../npm/node_modules/pi-web-access/index.ts");
       if (hasWebAccess !== (role === "researcher")) {
         throw new Error(`${name}: web-access role policy mismatch`);
       }

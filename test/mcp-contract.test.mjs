@@ -7,11 +7,13 @@ import test from "node:test";
 import {
   TOOL_DEFINITIONS,
   callTool,
+  createConfig,
   loadDelegationSets,
   normalizeAllowedPaths,
   resolveDelegationOptions,
   shutdownRpcHost,
   validateToolArguments,
+  waitForRun,
 } from "../pi-delegator/mcp/server.mjs";
 import { assertWriteTargetAllowed, capabilityCeiling } from "../pi-delegator/mcp/write-scope.mjs";
 
@@ -20,7 +22,7 @@ function fixtureConfig() {
   const delegationSetsFile = join(root, "delegation-sets.json");
   const modelCatalogFile = join(root, "models.json");
   writeFileSync(modelCatalogFile, JSON.stringify({
-    providers: { litellm: { models: [{ id: "llm-large" }, { id: "llm-medium" }] } },
+    providers: { litellm: { models: [{ id: "llm-large", reasoning: true }, { id: "llm-medium", reasoning: false }] } },
   }));
   writeFileSync(delegationSetsFile, JSON.stringify({
     version: 1,
@@ -74,9 +76,13 @@ input.on("line", (line) => {
   const request = JSON.parse(Buffer.from(message.message.split(" ")[1], "base64url").toString("utf8"));
   process.stdout.write(JSON.stringify({ id: message.id, type: "response", command: "prompt", success: true }) + "\\n");
   if (request.method === "ping") reply(request.requestId, { capabilities: { status: true, spawn: true, wait: true, stop: true, steer: true, resume: true } });
-  else if (request.method === "spawn") reply(request.requestId, { id: "run-native-1", status: "running", model: request.params.model, thinking: request.params.thinking });
-  else if (request.method === "wait") reply(request.requestId, { id: request.params.id, status: "completed", result: { kind: "text", text: "native done" }, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1, toolCalls: 0, durationMs: 3 } });
-  else if (request.method === "status") reply(request.requestId, { runs: [{ id: "run-native-1", status: "completed" }] });
+  else if (request.method === "spawn") {
+    if (!request.params.agent || !request.params.task) throw new Error("spawn requires agent and task");
+    reply(request.requestId, { text: "Async: researcher-mcp [run-native-1]", details: { asyncId: "run-native-1" } });
+  }
+  else if (request.method === "status") reply(request.requestId, request.params.id
+    ? { text: "Run: run-native-1\\nState: complete\\n\\nnative done", details: { mode: "single", results: [] } }
+    : { text: "Run: run-native-1", runs: [{ id: "run-native-1", status: "completed" }] });
   else reply(request.requestId, { id: request.params.id, status: request.method === "stop" ? "stopped" : "delivered" });
 });
 `);
@@ -107,7 +113,7 @@ test("resolveDelegationOptions applies explicit overrides", () => {
   assert.equal(options.model, "litellm/llm-large");
   assert.equal(options.requestedReasoning, "xhigh");
   assert.equal(options.percentage, 75);
-  assert.equal(options.effectiveThinking, "off");
+  assert.equal(options.effectiveThinking, "xhigh");
 });
 
 test("normalizeAllowedPaths deduplicates safe relative paths", () => {
@@ -138,6 +144,15 @@ test("MCP schemas validate timeout and reasoning values", () => {
   assert.throws(() => validateToolArguments(definition, { task: "Review", background: "yes" }), /background must be a boolean/);
 });
 
+test("real Pi launcher defaults to RPC mode", () => {
+  const config = createConfig({
+    PI_MCP_ALLOWED_ROOT: process.cwd(),
+    PI_CODING_AGENT_DIR: join(process.cwd(), ".pi-delegator"),
+  });
+  assert.deepEqual(config.rpcArgs, ["--mode", "rpc"]);
+  assert.equal(config.rpcHandshakeTimeoutMs, 90_000);
+});
+
 test("callTool routes background delegation through native RPC", async () => {
   const config = fixtureConfig();
   config.rpcArgs = [fakeRpcHostScript(config.root)];
@@ -163,6 +178,20 @@ test("callTool routes foreground delegation through native wait", async () => {
   } finally {
     await shutdownRpcHost(config);
   }
+});
+
+test("native wait returns the completed child output", async () => {
+  const config = fixtureConfig();
+  const id = "run-native-output";
+  const runDir = join(config.root, "async-subagent-runs", id);
+  mkdirSync(runDir, { recursive: true });
+  const outputPath = join(runDir, "output-0.log");
+  writeFileSync(outputPath, "PI_DELEGATION_OK\n");
+  const statusText = `Run: ${id}\nState: complete\nDir: ${runDir}\nOutput: ${outputPath}`;
+  const result = await waitForRun({ request: async () => ({ text: statusText }) }, id, 1000);
+  assert.equal(result.status, "completed");
+  assert.equal(result.result.text, "PI_DELEGATION_OK");
+  assert.equal(result.result.statusText, statusText);
 });
 
 test("callTool exposes native run status control", async () => {

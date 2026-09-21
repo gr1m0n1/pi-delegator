@@ -40,7 +40,25 @@
 <claude-mem-context>
 # Memory Context
 
-# [pi-delegator] recent context, 2026-08-18 9:19pm GMT+2
+# [pi-delegator] recent context, 2026-09-14 3:57pm GMT+2
 
-No previous sessions found.
+Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision
+Format: ID TIME TYPE TITLE
+Fetch details: get_observations([IDs]) | Search: mem-search skill
+
+Stats: 10 obs (4,230t read) | 560,826t work | 99% savings
+
+### Sep 14, 2026
+1342 3:50p 🔵 pi-delegator RepoVerity index status confirmed
+1343 3:52p 🔵 pi-delegator full architecture and current functionality mapped
+1344 " 🔵 pi-delegator checkout is 4 commits ahead of RepoVerity indexed snapshot
+1345 " 🔵 pi-delegator test coverage: two node:test files, no CI, no test command in package manifest
+1346 " 🔵 ctx_batch_execute for-loop commands fail with NODE_OPTIONS injection syntax error
+1347 3:55p 🔵 pi-delegator/settings.json still references legacy @tintinweb/pi-subagents@0.17.0 package
+1348 " 🔵 callTool native spawn does not pass task prompt — only model, thinking, and paths
+1349 " 🔵 Pi RPC host uses Pi extension_ui_request notification protocol over stdin/stdout
+1350 " 🔵 VS Code extension provides 4 commands and read-only activity tree with auto-refresh
+1351 " 🔵 write-scope capabilityCeiling: strict writers cannot use ctx_execute, bash, shell, or terminal
+
+Access 561k tokens of past work via get_observations([IDs]) or mem-search skill.
 </claude-mem-context>

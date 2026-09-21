@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -28,6 +28,7 @@ const ROLE_PROFILE_KEYS = {
   reviewer: "review",
 };
 const ROLE_AGENT_TYPES = {
+  orchestrator: "orchestrator-mcp",
   researcher: "researcher-mcp",
   coder: "coder-mcp",
   tester: "tester-mcp",
@@ -112,9 +113,11 @@ export function createConfig(env = process.env) {
     forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
     repoVerityRequired: booleanFlag(env.PI_REPOVERITY_REQUIRED, false),
     rpcLauncher: env.PI_MCP_PI_RPC ? resolve(env.PI_MCP_PI_RPC) : launcher,
-    rpcArgs: String(env.PI_MCP_RPC_ARGS || "").split(/\s+/).filter(Boolean),
+    rpcArgs: env.PI_MCP_RPC_ARGS === undefined
+      ? ["--mode", "rpc"]
+      : String(env.PI_MCP_RPC_ARGS).split(/\s+/).filter(Boolean),
     rpcSessionRoot: resolve(env.PI_MCP_RPC_SESSION_ROOT || resolve(runtimeRoot, "sessions", "mcp")),
-    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 10_000, 500, 300_000),
+    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 90_000, 500, 300_000),
     rpcRequestTimeoutMs: normalizeTimeoutSeconds(env.PI_MCP_RPC_REQUEST_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS) * 1000,
   };
 }
@@ -256,6 +259,15 @@ function allowedModels(config) {
   return new Set(models.map(({ id }) => id).filter((id) => typeof id === "string" && id));
 }
 
+function effectiveThinking(model, reasoning, config) {
+  if (!model || reasoning === "none") return "off";
+  const document = parseJsonFile(config.modelCatalogFile, "Pi model catalog");
+  const alias = model.replace(/^litellm\//, "");
+  const entry = document?.providers?.litellm?.models?.find((candidate) => candidate.id === alias);
+  if (entry?.reasoning !== true) return "off";
+  return reasoning === "ultra" ? "max" : reasoning;
+}
+
 function normalizeModel(value, config) {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value !== "string") throw new Error("model must be a string");
@@ -332,7 +344,7 @@ export function resolveDelegationOptions(role, args, config = createConfig()) {
     percentage,
     model,
     requestedReasoning: reasoning,
-    effectiveThinking: "off",
+    effectiveThinking: effectiveThinking(model, reasoning, config),
     roles: sets && selectedSet ? sets[selectedSet].roles : null,
   };
 }
@@ -687,7 +699,7 @@ function commonProperties(includePaths) {
     reasoning: {
       type: "string",
       enum: [...REASONING_LEVELS],
-      description: "Requested reasoning level; current Pi LiteLLM models clamp effective thinking to off.",
+      description: "Requested reasoning level; models without reasoning support use off.",
     },
     background: { type: "boolean", description: "Run the delegation in the background and return immediately with a run ID." },
   };
@@ -888,7 +900,7 @@ export function delegationSets(config = createConfig()) {
         semantics: {
           requested_percentage: "Target share of eligible supervisor work delegated across the wider task.",
           successful_percentage_for_this_unit: "100 only when this MCP unit returns COMPLETED; otherwise 0.",
-          effective_thinking: "off because current LiteLLM model catalog declares reasoning=false.",
+          effective_thinking: "Requested level when the selected LiteLLM model supports reasoning; otherwise off.",
         },
       }, null, 2),
     }],
@@ -932,6 +944,65 @@ export function status(config = createConfig()) {
 }
 
 const rpcHosts = new Map();
+
+function runIdFromSpawn(data) {
+  const id = data?.details?.asyncId ?? data?.details?.runId;
+  if (typeof id !== "string" || !id) throw new Error("Pi RPC spawn returned no async run ID");
+  return id;
+}
+
+function readRunOutputFromStatus(statusText, id) {
+  const runDir = /^Dir: (.+)$/m.exec(statusText)?.[1];
+  const outputPath = /^Output: (.+)$/m.exec(statusText)?.[1];
+  if (!runDir || !outputPath || !isAbsolute(runDir) || !isAbsolute(outputPath)) return null;
+  if (basename(runDir) !== id || basename(dirname(runDir)) !== "async-subagent-runs") return null;
+  try {
+    const realDir = realpathSync(runDir);
+    const realOutput = realpathSync(outputPath);
+    const pathWithinRun = relative(realDir, realOutput);
+    if (!pathWithinRun || pathWithinRun === ".." || pathWithinRun.startsWith(`..${sep}`) || isAbsolute(pathWithinRun)) return null;
+    if (statSync(realOutput).size > 1_000_000) return null;
+    return readFileSync(realOutput, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+export async function waitForRun(host, id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const remainingBeforeRequest = deadline - Date.now();
+    if (remainingBeforeRequest <= 0) return { id, status: "running" };
+    let data;
+    try {
+      data = await host.request("status", { id }, {
+        timeoutMs: Math.min(10_000, remainingBeforeRequest),
+        restartOnFailure: false,
+      });
+    } catch (error) {
+      if (/timed out/.test(String(error))) {
+        return { id, status: "running", reason: "Pi RPC status did not respond within the wait window" };
+      }
+      throw error;
+    }
+    const state = /^State: ([^\r\n]+)/m.exec(String(data?.text ?? ""))?.[1];
+    if (!state) throw new Error(`Pi RPC status returned no state for run ${id}`);
+    if (state !== "running" && state !== "queued") {
+      return {
+        id,
+        status: state === "complete" ? "completed" : state,
+        result: {
+          kind: "text",
+          text: state === "complete" ? readRunOutputFromStatus(String(data.text ?? ""), id) ?? String(data.text ?? "") : String(data.text ?? ""),
+          statusText: String(data.text ?? ""),
+        },
+      };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { id, status: "running" };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, remaining)));
+  }
+}
 
 async function getRpcHost(config) {
   let host = rpcHosts.get(config);
@@ -998,27 +1069,51 @@ export async function callTool(name, args = {}, config = createConfig(), token =
     const params = controlMethod === "status" ? {} : { id: args.id };
     if (controlMethod === "steer" || controlMethod === "resume") params.message = args.message;
     if (controlMethod === "wait" && args.timeout_ms !== undefined) params.timeout_ms = args.timeout_ms;
-    const data = await host.request(controlMethod, params);
+    const data = controlMethod === "wait"
+      ? await waitForRun(host, params.id, args.timeout_ms ?? config.timeoutSeconds * 1000)
+      : await host.request(controlMethod, params);
     return { content: [{ type: "text", text: JSON.stringify(data) }], isError: false };
   }
   void token;
   const resolution = resolveDelegationOptions(definition.role, args, config);
-  const spawnParams = { model: resolution.model, thinking: resolution.effectiveThinking };
-  if (WRITER_ROLES.has(definition.role)) {
-    const allowedPaths = normalizeAllowedPaths(args.allowed_paths ?? [], config.root, true);
-    if (allowedPaths.length) spawnParams.paths = allowedPaths;
-  }
+  const taskId = makeTaskId(args.task_id);
+  const allowedPaths = WRITER_ROLES.has(definition.role)
+    ? normalizeAllowedPaths(args.allowed_paths ?? [], config.root, true)
+    : [];
+  const task = [
+    `TASK_ID: ${taskId}`,
+    `OBJECTIVE: ${cleanText(args.task, "task", true)}`,
+    `SCOPE: ${cleanText(args.scope, "scope") || "Only the explicitly requested task."}`,
+    `CONSTRAINTS: ${cleanText(args.constraints, "constraints") || "Follow repository instructions and report evidence."}`,
+    `EXPECTED_OUTPUT: ${cleanText(args.expected_output, "expected_output") || "Evidence and terminal status."}`,
+    `DELEGATION_SET: ${resolution.set ?? "none"}`,
+    `DELEGATION_PERCENTAGE_TARGET: ${resolution.percentage ?? "unspecified"}`,
+    `ROLE_REASONING_REQUESTED: ${resolution.requestedReasoning || "unspecified"}`,
+    ...(definition.role === "orchestrator" && resolution.roles
+      ? [`ROLE_ROUTING: ${Object.entries(resolution.roles).map(([role, options]) => `${role}=${options.model}:${options.reasoning}`).join(", ")}`]
+      : []),
+    WRITER_ROLES.has(definition.role)
+      ? `STRICT WRITE SCOPE: ${allowedPaths.join(", ")}. Do not modify other paths.`
+      : "READ-ONLY: Do not create, edit, move, or delete files.",
+  ].join("\n");
+  const spawnParams = {
+    agent: ROLE_AGENT_TYPES[definition.role],
+    task,
+    model: `${resolution.model}:${resolution.effectiveThinking}`,
+    context: "fresh",
+  };
   const run = await host.request("spawn", spawnParams);
+  const runId = runIdFromSpawn(run);
   const modelLine = `${resolution.model}:${resolution.effectiveThinking}`;
   if (args.background === true) {
-    return { content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: PARTIAL` }], isError: false };
+    return { content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}\nSTATUS: PARTIAL` }], isError: false };
   }
-  const waited = await host.request("wait", { id: run.id });
-  const statusLine = String(waited.status || "completed").toUpperCase();
-  const resultText = waited.result?.text ?? "";
+  const waited = await waitForRun(host, runId, (args.timeout_seconds ?? config.timeoutSeconds) * 1000);
+  const statusLine = waited.status === "completed" ? "COMPLETED" : waited.status === "running" ? "PARTIAL" : "BLOCKED";
+  const resultText = waited.result?.text ?? waited.reason ?? "Run is still active.";
   return {
-    content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],
-    isError: false,
+    content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],
+    isError: statusLine === "BLOCKED",
   };
 }
 
