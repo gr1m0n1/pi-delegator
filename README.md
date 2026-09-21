@@ -32,7 +32,7 @@ The model is simple:
 ## Quick Start
 
 ```bash
-./pi-delegator/scripts/install.sh
+PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh
 ./.pi-delegator/scripts/check_pi_setup.sh
 ./.pi-delegator/bin/pi-agent
 ./.pi-delegator/bin/pi
@@ -41,12 +41,14 @@ The model is simple:
 To install `.pi-delegator/` inside another repository or directory:
 
 ```bash
-./pi-delegator/scripts/install.sh --install-dir /path/to/target-repo
+PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh --install-dir /path/to/target-repo
 cd /path/to/target-repo
 ./.pi-delegator/scripts/check_pi_setup.sh
 ./.pi-delegator/bin/pi-agent
 ./.pi-delegator/bin/pi
 ```
+
+The package override is needed while `install.sh` still defaults to the legacy `@tintinweb/pi-subagents@0.17.0`; the checked-in Pi settings and RPC bridge use `pi-subagents@0.65.0`.
 
 ## Example Prompt
 
@@ -63,11 +65,11 @@ relevant tests, and finish with a summary of changes, risks, and next steps.
 
 This kind of prompt works well because it gives Pi a clear objective, a bounded implementation scope, and an expected final output.
 
-If no `delegation_set` is specified, `pi-delegator` uses the `default` set automatically. That set targets `50%` delegation and uses `llm-large` with `medium` reasoning for every role.
+If no `delegation_set` is specified, `pi-delegator` uses the `default` set automatically. That set targets `50%` delegation. Its role-specific models and reasoning levels are defined in `pi-delegator/delegation-sets.json`.
 
 ## Delegation Sets
 
-- `default`: the safest general-purpose option. It uses `llm-large` with `medium` reasoning for every role and targets `50%` delegation when you do not specify anything else.
+- `default`: the general-purpose option. It targets `50%` delegation, uses `llm-large` with `xhigh` reasoning for orchestration and implementation, and uses `llm-medium` with reasoning off for research, tests, and review.
 - `balanced`: a mixed profile for normal development work. It keeps the orchestrator strong, gives implementation more reasoning depth, and is a good default when you want active delegation without going all-in.
 - `fast`: optimized for speed and lower reasoning cost. Use it for lighter tasks, quick inspections, or cases where turnaround matters more than depth.
 - `deep`: optimized for heavy analysis and more ambitious delegation. Use it for harder implementation, broader reviews, or tasks where extra reasoning is worth the additional cost and latency.
@@ -110,8 +112,8 @@ Timeout behavior is:
 
 - timeouts are measured in seconds.
 - valid values are `1` through `7200`.
-- omitted, invalid, or `0` timeout values fall back to `7200`.
-- `PI_MCP_TIMEOUT_SECONDS` acts as the maximum allowed timeout for any individual tool call.
+- omitted or invalid `PI_MCP_TIMEOUT_SECONDS` values fall back to `7200`.
+- an explicit `timeout_seconds` outside the valid range is rejected. A valid per-call value controls the foreground wait; it does not stop the underlying run when the wait expires.
 
 Subagents must emit their started lifecycle event within `PI_SUBAGENT_START_TIMEOUT_MS` (default and minimum `60000`). When this does not happen, Pi records `delegation_start_timeout` with terminal status `failed` and removes the pending delegation instead of leaving it queued indefinitely. On Pi session shutdown, active runtime sessions are recorded as `interrupted` and removed from the active-session state file.
 
@@ -133,18 +135,18 @@ The RPC host process and its sessions are configured through environment variabl
 | Variable | Purpose |
 | --- | --- |
 | `PI_MCP_PI_RPC` | Launcher command for the RPC host. Defaults to the same launcher as delegations (`bin/pi-agent`). Point it at a fixture (for example, `node`) in tests. |
-| `PI_MCP_RPC_ARGS` | Space-separated arguments passed to the RPC host launcher; used by the smoke test to run `test/fixtures/fake-pi-rpc-host.mjs`. |
+| `PI_MCP_RPC_ARGS` | Space-separated arguments passed to the RPC host launcher. Defaults to `--mode rpc`; the smoke test overrides it with `test/fixtures/fake-pi-rpc-host.mjs`. |
 | `PI_MCP_RPC_SESSION_ROOT` | Session storage for the host. Defaults to `.pi-delegator/sessions/mcp/`. |
-| `PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS` | Handshake timeout in milliseconds (default `10000`, minimum `500`). |
+| `PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS` | Handshake timeout in milliseconds (default `90000`, minimum `500`). |
 | `PI_MCP_RPC_REQUEST_TIMEOUT_SECONDS` | Per-request timeout in seconds; valid values are `1` through `7200`, defaulting to `7200`. |
 
 ## Repository Instruction Preflight
 
-Before delegating work, the MCP server reads the target repository's root `AGENTS.md` when present. If those instructions require external MCP/tool families such as RepoVerity (`code_index_status`, `code_retrieve`, `code_search_exact`) or context-mode (`ctx_execute`, `ctx_batch_execute`), delegation is blocked unless the Pi runtime has those tools configured.
+The server has a repository-instruction preflight that reads the target repository's root `AGENTS.md` and checks required MCP tool families. The current MCP `tools/call` delegation path uses the Pi RPC host and does not invoke that preflight. Check the delegated Pi runtime's tools before relying on repository instructions that require RepoVerity or Context Mode.
 
 context-mode is managed by this runtime: `settings.json` installs `npm:context-mode`, `mcp.json` registers the MCP server command, and `install.sh` installs the `context-mode` CLI that Pi uses to start the server. When those files are present and the CLI is on `PATH`, all `ctx_*` tools are treated as available.
 
-Context Mode is forced by default (`PI_FORCE_CONTEXT_MODE=1`). The MCP server requires `ctx_execute` and `ctx_batch_execute` before delegating, even when the target repository has no explicit context-mode rule. Delegated researcher/reviewer agents only receive `ctx_*` tools; coder/tester agents receive `ctx_*` plus `edit`/`write` for bounded file changes. Set `PI_FORCE_CONTEXT_MODE=0` only for an intentional local bypass.
+`PI_FORCE_CONTEXT_MODE=1` is the default for the preflight, but it is not currently enforced by the RPC delegation path. Agent profiles list their allowed tools, including `ctx_*` tools and, for writer profiles, `edit`/`write`.
 
 RepoVerity is integrated when available, but optional by default. During sync, pi-delegator copies a `repoverity` server from the target workspace's `.vscode/mcp.json` into the Pi runtime `mcp.json`. If no workspace MCP entry exists, set `PI_REPOVERITY_REPOSITORY`, `PI_REPOVERITY_REMOTE_URL`, `PI_REPOVERITY_TOKEN_FILE`, and optionally `PI_REPOVERITY_COMMAND`, `PI_REPOVERITY_LOGICAL_REF`, or `PI_REPOVERITY_SERVER_NAME` before running `sync_pi_installation.mjs` or `install.sh`. Set `PI_REPOVERITY_REQUIRED=1` when missing RepoVerity should block delegation.
 
@@ -155,25 +157,25 @@ PI_AVAILABLE_EXTERNAL_TOOLS=code_index_status,code_retrieve,code_search_exact
 PI_AVAILABLE_MCP_TOOLS=code_index_status,code_retrieve,code_search_exact
 ```
 
-Only set these after confirming the spawned Pi process can actually call those tools. Otherwise the safer behavior is to return `STATUS: BLOCKED` and report the missing MCP/tool names.
+Only set these after confirming the spawned Pi process can actually call those tools. These declarations affect preflight availability checks; they do not install tools.
 
 ## Default Pi Packages
 
-The generated runtime installs these packages by default:
+`pi-delegator/settings.json` declares these Pi packages:
 
-- `@tintinweb/pi-subagents@0.17.0`: agent delegation, parallel workflows, nested-agent limits, and per-agent extension/tool scoping.
+- `pi-subagents@0.65.0`: native agent delegation and async run control.
 - `context-mode`: context-efficient repository inspection and command execution through `ctx_*` MCP tools.
 - `pi-lens@4.1.3`: LSP, lint, formatting, type-checking, and structural diagnostics.
 - `@juicesharp/rpiv-ask-user-question@2.9.0`: structured clarification questions in interactive sessions.
 - `pi-web-access@0.27.0`: public web search, direct HTTP content extraction, and source verification for researcher profiles.
 
-The package list is pinned in `pi-delegator/settings.json`. `install.sh` installs the same packages into `.pi-delegator/npm`, and `check_pi_setup.sh` verifies both the declarations and installed package files.
+`install.sh` currently defaults to the legacy `@tintinweb/pi-subagents@0.17.0` independently of `settings.json`. Set `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0` during installation, as shown above. The setup check verifies the other listed packages, but does not currently verify which subagent package is installed.
 
 ### Sub-Agent Package Policy
 
 Sub-agent access is explicit rather than inherited implicitly. Each profile declares both the extension to load and the extension tool exposed to its model:
 
-- all eight profiles load `pi-lens` and expose `lens_diagnostics`.
+- all eight specialist profiles load `pi-lens` and expose `lens_diagnostics`.
 - `coder`, `tester`, and `reviewer`, including their MCP variants, must call `lens_diagnostics` with `mode=all` before finishing and must resolve or report blocking diagnostics.
 - interactive profiles expose `ask_user_question` when clarification is required.
 - MCP profiles do not expose `ask_user_question`, because delegated MCP runs have no interactive UI and the extension rejects UI-less calls.
@@ -204,7 +206,7 @@ PI SETUP: OK
 
 ## Useful Commands
 
-- install: `./pi-delegator/scripts/install.sh`
+- install: `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh`
 - verify: `./pi-delegator/scripts/check_pi_setup.sh`
 - Pixel Agents smoke test: `node ./pi-delegator/scripts/test_pixel_agents.mjs`
 - Pixel Agents smoke test against an external install: `node ./pi-delegator/scripts/test_pixel_agents.mjs --launcher /path/to/bin/pi-agent`

@@ -60,6 +60,19 @@ done
 target_root="$(realpath -m "${target_root}")"
 runtime_root="${target_root}/.pi-delegator"
 env_file="${runtime_root}/pi.env"
+models_file="${runtime_root}/models.json"
+models_backup_dir=""
+
+if [[ -f "$models_file" ]]; then
+  models_backup_dir="$(mktemp -d "${TMPDIR:-/tmp}/pi-delegator-models.XXXXXX")"
+  cp -p "$models_file" "${models_backup_dir}/models.json"
+  restore_models() {
+    cp -p "${models_backup_dir}/models.json" "$models_file"
+    rm -rf "$models_backup_dir"
+    models_backup_dir=""
+  }
+  trap 'if [[ -n "${models_backup_dir}" && -f "${models_backup_dir}/models.json" ]]; then restore_models; fi' EXIT
+fi
 
 nvm_script="${NVM_DIR:-${HOME}/.nvm}/nvm.sh"
 if [[ ! -s "$nvm_script" ]]; then
@@ -124,6 +137,11 @@ if ((activity_view)); then
   code_command="${VSCODE_CLI:-code}"
   command -v "${code_command}" >/dev/null || { echo "VS Code CLI not found: ${code_command}" >&2; exit 2; }
   timeout 30s "${code_command}" --install-extension "${extension_file}" --force
+fi
+
+if [[ -n "$models_backup_dir" ]]; then
+  restore_models
+  trap - EXIT
 fi
 
 printf -v runtime_root_q '%q' "${runtime_root}"

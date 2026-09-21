@@ -15,11 +15,11 @@ input.on("line", (line) => {
   if (request.method === "ping") {
     reply(request.requestId, { capabilities: { status: true, spawn: true, wait: true, stop: true, steer: true, resume: true } });
   } else if (request.method === "spawn") {
-    reply(request.requestId, { id: "fixture-run", status: "running", model: request.params.model ?? null, thinking: request.params.thinking ?? null });
-  } else if (request.method === "wait") {
-    reply(request.requestId, { id: request.params.id, status: "completed", result: { kind: "text", text: "fixture complete" } });
+    reply(request.requestId, { text: "Async: researcher-mcp [fixture-run]", details: { asyncId: "fixture-run" } });
   } else if (request.method === "status") {
-    reply(request.requestId, { runs: [{ id: "fixture-run", status: "completed" }] });
+    reply(request.requestId, request.params.id
+      ? { text: "Run: fixture-run\nState: complete\n\nfixture complete\nSTATUS: COMPLETED", details: { mode: "single", results: [] } }
+      : { text: "Run: fixture-run", runs: [{ id: "fixture-run", status: "completed" }] });
   } else if (request.method === "stop") {
     reply(request.requestId, { id: request.params.id, status: "stopped" });
   } else if (request.method === "steer") {

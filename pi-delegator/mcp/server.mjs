@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { delimiter, dirname, isAbsolute, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import readline from "node:readline";
 
@@ -28,6 +28,7 @@ const ROLE_PROFILE_KEYS = {
   reviewer: "review",
 };
 const ROLE_AGENT_TYPES = {
+  orchestrator: "orchestrator-mcp",
   researcher: "researcher-mcp",
   coder: "coder-mcp",
   tester: "tester-mcp",
@@ -38,7 +39,34 @@ const MAX_ACTIVITY_EVENTS = 100;
 const ACTIVE_SESSION_STALE_MS = integer(process.env.PI_ACTIVE_SESSION_STALE_MS, 90_000, 10_000, 3_600_000);
 const FALLBACK_DELEGATION_SET = "default";
 const SET_ROLES = ["research", "implement", "tests", "review", "orchestrate"];
-const REASONING_LEVELS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const JEV_MODES = new Set(["off", "observe", "auto"]);
+const JEV_PROVIDERS = new Set(["typesafe", "openrouter"]);
+const JEV_DECISIONS = new Set(["delegation_set", "initial_role", "research_first", "request_sufficiency", "additional_review_focus"]);
+const ROUTABLE_ROLES = new Set(["orchestrator", "researcher", "coder", "tester", "reviewer"]);
+const JEV_QUESTION_INSTRUCTIONS = {
+  delegation_set: "Which configured delegation profile best fits the task's complexity and constraints?",
+  initial_role: "Which specialist should start this task? Choose orchestrator for work requiring multiple specialists.",
+  research_first: "Must repository facts be investigated before a writer can safely complete this task?",
+  request_sufficiency: "Can this task proceed from the supplied information, or is a missing user preference essential? Repository facts that can be investigated do not require clarification.",
+  additional_review_focus: "Which extra review focus is justified by the task? Choose none when no extra focus is needed.",
+};
+const JEV_CHOICE_DESCRIPTIONS = {
+  orchestrator: "Coordinate several specialists and complete a multi-step task",
+  researcher: "Investigate repository facts without changing files",
+  coder: "Implement a scoped code change",
+  tester: "Add or run tests within the supplied write scope",
+  reviewer: "Review existing work without changing files",
+  yes: "Research is needed before implementation",
+  no: "Implementation can proceed with the current context",
+  sufficient: "Enough information is available or can be investigated",
+  needs_clarification: "An essential user choice is missing",
+  none: "No extra review focus",
+  tests: "Test coverage and behavior",
+  security: "Security and permissions",
+  architecture: "Architecture and interfaces",
+  regression: "Existing behavior and regressions",
+};
+const REASONING_LEVELS = new Set(["none", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const REQUIRED_REPOSITORY_TOOL_GROUPS = [
   {
     name: "RepoVerity",
@@ -112,10 +140,18 @@ export function createConfig(env = process.env) {
     forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
     repoVerityRequired: booleanFlag(env.PI_REPOVERITY_REQUIRED, false),
     rpcLauncher: env.PI_MCP_PI_RPC ? resolve(env.PI_MCP_PI_RPC) : launcher,
-    rpcArgs: String(env.PI_MCP_RPC_ARGS || "").split(/\s+/).filter(Boolean),
+    rpcArgs: env.PI_MCP_RPC_ARGS === undefined
+      ? ["--mode", "rpc"]
+      : String(env.PI_MCP_RPC_ARGS).split(/\s+/).filter(Boolean),
     rpcSessionRoot: resolve(env.PI_MCP_RPC_SESSION_ROOT || resolve(runtimeRoot, "sessions", "mcp")),
-    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 10_000, 500, 300_000),
+    rpcHandshakeTimeoutMs: integer(env.PI_MCP_RPC_HANDSHAKE_TIMEOUT_MS, 90_000, 500, 300_000),
     rpcRequestTimeoutMs: normalizeTimeoutSeconds(env.PI_MCP_RPC_REQUEST_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS) * 1000,
+    jevConfigFile: env.PI_JEV_CONFIG_FILE ? resolve(env.PI_JEV_CONFIG_FILE) : null,
+    jevModeOverride: env.PI_JEV_MODE === undefined ? null : String(env.PI_JEV_MODE).trim(),
+    jevApiKeyOverrides: {
+      typesafe: env.TYPESAFE_API_KEY || "",
+      openrouter: env.OPENROUTER_API_KEY || "",
+    },
   };
 }
 
@@ -256,6 +292,15 @@ function allowedModels(config) {
   return new Set(models.map(({ id }) => id).filter((id) => typeof id === "string" && id));
 }
 
+function effectiveThinking(model, reasoning, config) {
+  if (!model || reasoning === "none" || reasoning === "off") return "off";
+  const document = parseJsonFile(config.modelCatalogFile, "Pi model catalog");
+  const alias = model.replace(/^litellm\//, "");
+  const entry = document?.providers?.litellm?.models?.find((candidate) => candidate.id === alias);
+  if (entry?.reasoning !== true) return "off";
+  return reasoning === "ultra" ? "max" : reasoning;
+}
+
 function normalizeModel(value, config) {
   if (value === undefined || value === null || value === "") return "";
   if (typeof value !== "string") throw new Error("model must be a string");
@@ -300,11 +345,26 @@ export function loadDelegationSets(config = createConfig()) {
       if (!options || typeof options !== "object" || Array.isArray(options)) {
         throw new Error(`Delegation role ${setName}.${role} must be an object`);
       }
-      const unknownOptions = Object.keys(options).filter((key) => !["model", "reasoning"].includes(key));
+      const unknownOptions = Object.keys(options).filter((key) => !["model", "reasoning", "fallback"].includes(key));
       if (unknownOptions.length) throw new Error(`Unknown options in ${setName}.${role}: ${unknownOptions.join(", ")}`);
+      let fallback = null;
+      if (options.fallback !== undefined) {
+        if (!options.fallback || typeof options.fallback !== "object" || Array.isArray(options.fallback)) {
+          throw new Error(`Fallback in ${setName}.${role} must be an object`);
+        }
+        const unknownFallbackOptions = Object.keys(options.fallback).filter((key) => !["model", "reasoning"].includes(key));
+        if (unknownFallbackOptions.length) {
+          throw new Error(`Unknown fallback options in ${setName}.${role}: ${unknownFallbackOptions.join(", ")}`);
+        }
+        fallback = {
+          model: normalizeModel(options.fallback.model, config),
+          reasoning: validateReasoning(options.fallback.reasoning),
+        };
+      }
       roles[role] = {
         model: normalizeModel(options.model, config),
         reasoning: validateReasoning(options.reasoning),
+        ...(fallback ? { fallback } : {}),
       };
     }
     parsed[setName.trim()] = { delegation_percentage: percentage, roles };
@@ -314,7 +374,7 @@ export function loadDelegationSets(config = createConfig()) {
 
 export function resolveDelegationOptions(role, args, config = createConfig()) {
   const selectedSet = cleanText(args.delegation_set, "delegation_set") || config.defaultDelegationSet;
-  let configured = { model: "", reasoning: "" };
+  let configured = { model: "", reasoning: "", fallback: null };
   let configuredPercentage = null;
   let sets = null;
   if (selectedSet) {
@@ -332,8 +392,323 @@ export function resolveDelegationOptions(role, args, config = createConfig()) {
     percentage,
     model,
     requestedReasoning: reasoning,
-    effectiveThinking: "off",
+    effectiveThinking: effectiveThinking(model, reasoning, config),
+    fallback: configured.fallback
+      ? {
+          model: configured.fallback.model,
+          reasoning: configured.fallback.reasoning,
+          effectiveThinking: effectiveThinking(configured.fallback.model, configured.fallback.reasoning, config),
+        }
+      : null,
     roles: sets && selectedSet ? sets[selectedSet].roles : null,
+  };
+}
+
+function validateJevMode(value, source) {
+  const mode = String(value ?? "off").trim() || "off";
+  if (!JEV_MODES.has(mode)) throw new Error(`${source} must be one of ${[...JEV_MODES].join(", ")}`);
+  return mode;
+}
+
+function normalizeJevDecisionConfig(name, value = {}) {
+  if (!JEV_DECISIONS.has(name)) throw new Error(`Unsupported Jev decision: ${name}`);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Jev decision ${name} must be an object`);
+  }
+  const allowed = new Set(["enabled", "allowed_values", "min_choice_probability", "min_confidence"]);
+  const unknown = Object.keys(value).filter((key) => !allowed.has(key));
+  if (unknown.length) throw new Error(`Unknown options in Jev decision ${name}: ${unknown.join(", ")}`);
+  if (value.enabled !== undefined && typeof value.enabled !== "boolean") throw new Error(`Jev decision ${name}.enabled must be a boolean`);
+  const enabled = value.enabled === true;
+  const allowedValues = value.allowed_values === undefined
+    ? []
+    : value.allowed_values;
+  if (!Array.isArray(allowedValues) || allowedValues.some((entry) => typeof entry !== "string" || !entry.trim()) || new Set(allowedValues).size !== allowedValues.length) {
+    throw new Error(`Jev decision ${name}.allowed_values must be an array of non-empty strings`);
+  }
+  const minChoiceProbability = Number(value.min_choice_probability ?? 0.9);
+  const minConfidence = Number(value.min_confidence ?? 0.8);
+  if (!Number.isFinite(minChoiceProbability) || minChoiceProbability < 0 || minChoiceProbability > 1) {
+    throw new Error(`Jev decision ${name}.min_choice_probability must be between 0 and 1`);
+  }
+  if (!Number.isFinite(minConfidence) || minConfidence < 0 || minConfidence > 1) {
+    throw new Error(`Jev decision ${name}.min_confidence must be between 0 and 1`);
+  }
+  return {
+    enabled,
+    allowedValues: allowedValues.map((entry) => entry.trim()),
+    minChoiceProbability,
+    minConfidence,
+  };
+}
+
+export function loadJevConfig(config = createConfig()) {
+  const raw = config.jevConfigFile
+    ? JSON.parse(readFileSync(config.jevConfigFile, "utf8"))
+    : {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Jev config must be an object");
+  const unknown = Object.keys(raw).filter((key) => !["version", "mode", "provider", "timeout_ms", "max_calls_per_task", "fallback", "decisions"].includes(key));
+  if (unknown.length) throw new Error(`Unknown Jev config options: ${unknown.join(", ")}`);
+  const mode = validateJevMode(config.jevModeOverride ?? raw.mode ?? "off", "Jev mode");
+  const provider = raw.provider ?? { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" };
+  if (!provider || typeof provider !== "object" || Array.isArray(provider)) throw new Error("Jev provider must be an object");
+  const unknownProvider = Object.keys(provider).filter((key) => !["name", "model", "api_key_env"].includes(key));
+  if (unknownProvider.length) throw new Error(`Unknown Jev provider options: ${unknownProvider.join(", ")}`);
+  const providerName = String(provider.name ?? "").trim();
+  if (!JEV_PROVIDERS.has(providerName)) throw new Error(`Jev provider.name must be one of ${[...JEV_PROVIDERS].join(", ")}`);
+  const model = cleanText(provider.model ?? (providerName === "openrouter" ? "typesafe/jev-1.13" : "jev-latest"), "provider.model", true);
+  const apiKeyEnv = cleanText(provider.api_key_env ?? (providerName === "openrouter" ? "OPENROUTER_API_KEY" : "TYPESAFE_API_KEY"), "provider.api_key_env", true);
+  const decisions = {};
+  const rawDecisions = raw.decisions ?? {};
+  if (!rawDecisions || typeof rawDecisions !== "object" || Array.isArray(rawDecisions)) throw new Error("Jev decisions must be an object");
+  for (const [name, value] of Object.entries(rawDecisions)) decisions[name] = normalizeJevDecisionConfig(name, value);
+  for (const name of JEV_DECISIONS) {
+    if (!decisions[name]) decisions[name] = normalizeJevDecisionConfig(name, { enabled: false });
+  }
+  const timeoutMs = raw.timeout_ms === undefined ? 1500 : raw.timeout_ms;
+  const maxCallsPerTask = raw.max_calls_per_task === undefined ? 1 : raw.max_calls_per_task;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000) throw new Error("Jev timeout_ms must be an integer between 100 and 30000");
+  if (!Number.isInteger(maxCallsPerTask) || maxCallsPerTask < 1 || maxCallsPerTask > 10) throw new Error("Jev max_calls_per_task must be an integer between 1 and 10");
+  if (raw.version !== undefined && raw.version !== 1) throw new Error("Unsupported Jev config version");
+  if (raw.fallback !== undefined && raw.fallback !== "existing_behavior") throw new Error("Unsupported Jev fallback");
+  return {
+    version: raw.version ?? 1,
+    mode,
+    provider: {
+      name: providerName,
+      model,
+      apiKeyEnv,
+      apiKey: config.jevApiKeyOverrides?.[providerName] || process.env[apiKeyEnv] || "",
+    },
+    timeoutMs,
+    maxCallsPerTask,
+    fallback: raw.fallback ?? "existing_behavior",
+    decisions,
+  };
+}
+
+function jevActivityLogPath(config) {
+  return resolve(process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs"), "pi-jev-decisions.jsonl");
+}
+
+function logJevDecision(config, entry) {
+  try {
+    mkdirSync(dirname(jevActivityLogPath(config)), { recursive: true });
+    appendFileSync(jevActivityLogPath(config), `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`);
+  } catch {}
+}
+
+function normalizeJevDecisionResult(raw, allowedValues) {
+  const choice = cleanText(raw?.choice ?? raw?.answer ?? raw?.value ?? "", "Jev choice");
+  const probability = Number(raw?.probabilities?.[choice] ?? raw?.probability ?? raw?.choice_probability ?? 0);
+  const confidence = Number(raw?.confidence ?? raw?.confidence_score ?? 0);
+  const reason = cleanText(raw?.reason ?? raw?.explanation ?? "", "Jev reason");
+  if (!choice) return { choice: "", probability: 0, confidence: 0, reason, valid: false };
+  const valid = allowedValues.includes(choice) && probability >= 0 && probability <= 1 && confidence >= 0 && confidence <= 1;
+  return {
+    choice,
+    probability: Number.isFinite(probability) ? probability : 0,
+    confidence: Number.isFinite(confidence) ? confidence : 0,
+    reason,
+    valid,
+  };
+}
+
+async function withTimeout(promise, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Jev decision timed out after ${timeoutMs}ms`)), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function callJevProvider(jevConfig, decision, state, allowedValues) {
+  if (!jevConfig.provider.apiKey) throw new Error(`Missing ${jevConfig.provider.apiKeyEnv}`);
+  const question = {
+    type: "choice",
+    instructions: JEV_QUESTION_INSTRUCTIONS[decision],
+    criteria: Object.fromEntries(allowedValues.map((value) => [value, JEV_CHOICE_DESCRIPTIONS[value] ?? null])),
+  };
+  const body = {
+    model: jevConfig.provider.model,
+    state,
+    questions: { [decision]: question },
+  };
+  const endpoint = jevConfig.provider.name === "openrouter"
+    ? "https://openrouter.ai/api/v1/alpha/decisions"
+    : "https://api.typesafe.ai/v1/systemone";
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${jevConfig.provider.apiKey}`,
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(jevConfig.timeoutMs),
+  });
+  if (!response.ok) throw new Error(`Jev provider ${jevConfig.provider.name} returned HTTP ${response.status}`);
+  const data = await response.json();
+  const answer = data?.answers?.[decision];
+  if (!answer || answer.type !== "choice") throw new Error("Jev returned a malformed choice answer");
+  return normalizeJevDecisionResult(answer, allowedValues);
+}
+
+async function decideWithJev(decision, state, config, defaults = {}, budget = null) {
+  const started = Date.now();
+  const jevConfig = loadJevConfig(config);
+  const decisionConfig = jevConfig.decisions[decision];
+  const base = {
+    decision,
+    task_id: state.task_id ?? null,
+    mode: jevConfig.mode,
+    provider: jevConfig.provider.name,
+    model: jevConfig.provider.model,
+    question_version: 1,
+  };
+  if (jevConfig.mode === "off" || !decisionConfig?.enabled) {
+    return { mode: jevConfig.mode, applied: false, fallbackCode: "disabled", recommendation: null };
+  }
+  try {
+    const supportedValues = defaults.allowedValues ?? [];
+    const allowedValues = decisionConfig.allowedValues.length
+      ? decisionConfig.allowedValues.filter((value) => supportedValues.includes(value))
+      : supportedValues;
+    if (!allowedValues.length) throw new Error(`Jev decision ${decision} has no supported allowed values`);
+    if (budget && budget.remaining <= 0) {
+      logJevDecision(config, { ...base, recommendation: null, applied_choice: null, duration_ms: 0, fallback_code: "call_limit" });
+      return { mode: jevConfig.mode, applied: false, fallbackCode: "call_limit", recommendation: null };
+    }
+    if (budget) budget.remaining -= 1;
+    const raw = config.jevDecisionClient
+      ? await config.jevDecisionClient({ decision, state, allowedValues, jevConfig, decisionConfig })
+      : await withTimeout(callJevProvider(jevConfig, decision, state, allowedValues), jevConfig.timeoutMs);
+    const recommendation = normalizeJevDecisionResult(raw, allowedValues);
+    const thresholdsMet = recommendation.valid &&
+      recommendation.probability >= decisionConfig.minChoiceProbability &&
+      recommendation.confidence >= decisionConfig.minConfidence;
+    const applied = jevConfig.mode === "auto" && thresholdsMet;
+    const fallbackCode = applied ? null : !recommendation.valid ? "invalid_response" : thresholdsMet ? "observe_mode" : "below_threshold";
+    logJevDecision(config, {
+      ...base,
+      recommendation: recommendation.choice || null,
+      applied_choice: applied ? recommendation.choice : null,
+      confidence: recommendation.confidence,
+      probability: recommendation.probability,
+      duration_ms: Date.now() - started,
+      fallback_code: fallbackCode,
+    });
+    return {
+      mode: jevConfig.mode,
+      applied,
+      fallbackCode,
+      recommendation,
+    };
+  } catch (error) {
+    logJevDecision(config, {
+      ...base,
+      recommendation: null,
+      applied_choice: null,
+      duration_ms: Date.now() - started,
+      fallback_code: "error",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { mode: jevConfig.mode, applied: false, fallbackCode: "error", recommendation: null, error };
+  }
+}
+
+async function resolveDelegationOptionsWithJev(role, args, config, budget) {
+  if (args.delegation_set !== undefined && args.delegation_set !== null && args.delegation_set !== "") {
+    return { resolution: resolveDelegationOptions(role, args, config), decision: null };
+  }
+  const sets = loadDelegationSets(config);
+  const decision = await decideWithJev("delegation_set", {
+    task_id: args.task_id,
+    task: cleanText(args.task, "task"),
+    scope: cleanText(args.scope, "scope"),
+    constraints: cleanText(args.constraints, "constraints"),
+    role,
+    available_delegation_sets: Object.keys(sets).sort(),
+    delegation_profiles: Object.fromEntries(Object.entries(sets).map(([name, set]) => [name, {
+      delegation_percentage: set.delegation_percentage,
+      roles: set.roles,
+    }])),
+  }, config, { allowedValues: Object.keys(sets).sort() }, budget);
+  const selectedArgs = decision.applied
+    ? { ...args, delegation_set: decision.recommendation.choice }
+    : args;
+  return { resolution: resolveDelegationOptions(role, selectedArgs, config), decision };
+}
+
+async function selectRouteRole(args, config, budget) {
+  const allowedPathsPresent = Array.isArray(args.allowed_paths) && args.allowed_paths.length > 0;
+  const decision = await decideWithJev("initial_role", {
+    task_id: args.task_id,
+    task: cleanText(args.task, "task", true),
+    scope: cleanText(args.scope, "scope"),
+    constraints: cleanText(args.constraints, "constraints"),
+    expected_output: cleanText(args.expected_output, "expected_output"),
+    allowed_paths_present: allowedPathsPresent,
+  }, config, { allowedValues: [...ROUTABLE_ROLES] }, budget);
+  const role = decision.applied && ROUTABLE_ROLES.has(decision.recommendation.choice)
+    ? decision.recommendation.choice
+    : (allowedPathsPresent ? "orchestrator" : "researcher");
+  return { role, decision };
+}
+
+async function applyRoutePhaseDecisions(args, config, selectedRole, budget) {
+  const commonState = {
+    task_id: args.task_id,
+    task: cleanText(args.task, "task", true),
+    scope: cleanText(args.scope, "scope"),
+    constraints: cleanText(args.constraints, "constraints"),
+    expected_output: cleanText(args.expected_output, "expected_output"),
+    selected_role: selectedRole,
+    allowed_paths_present: Array.isArray(args.allowed_paths) && args.allowed_paths.length > 0,
+  };
+  const sufficiency = await decideWithJev("request_sufficiency", commonState, config, {
+    allowedValues: ["sufficient", "needs_clarification"],
+  }, budget);
+  if (sufficiency.applied && sufficiency.recommendation.choice === "needs_clarification") {
+    return {
+      role: selectedRole,
+      decisions: { request_sufficiency: sufficiency },
+      blocked: {
+        text: [
+          "STATUS: PARTIAL",
+          "REASON: Jev recommended asking for clarification before delegation.",
+          `JEV_REQUEST_SUFFICIENCY_RECOMMENDATION: ${sufficiency.recommendation.choice}`,
+        ].join("\n"),
+      },
+    };
+  }
+  const researchFirst = await decideWithJev("research_first", commonState, config, {
+    allowedValues: ["yes", "no"],
+  }, budget);
+  const researchBeforeWriting = researchFirst.applied && researchFirst.recommendation.choice === "yes" && WRITER_ROLES.has(selectedRole);
+  const role = researchBeforeWriting
+    ? "orchestrator"
+    : selectedRole;
+  const reviewFocus = role === "researcher" ? null : await decideWithJev("additional_review_focus", { ...commonState, selected_role: role }, config, {
+    allowedValues: ["none", "tests", "security", "architecture", "regression"],
+  }, budget);
+  const reviewRequested = reviewFocus?.applied && reviewFocus.recommendation.choice !== "none";
+  return {
+    role: reviewRequested && WRITER_ROLES.has(role) ? "orchestrator" : role,
+    researchBeforeWriting,
+    plannedWriterRole: researchBeforeWriting ? selectedRole : null,
+    decisions: {
+      request_sufficiency: sufficiency,
+      research_first: researchFirst,
+      additional_review_focus: reviewFocus,
+    },
+    blocked: null,
   };
 }
 
@@ -438,7 +813,7 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
   const agentType = dynamicProfile ? ROLE_AGENT_TYPES[role] : role;
   const agent = role === "orchestrator" ? "the minimum necessary specialist agents" : agentType;
   const agentParameters = dynamicProfile && role !== "orchestrator"
-    ? ` Pass model: \"${resolution.model}\" and thinking: \"${resolution.effectiveThinking}\" in the Agent call.`
+    ? ` Pass model: \"${resolution.model}\" and thinking: \"${resolution.effectiveThinking}\" in the Agent call.${resolution.fallback ? ` If that call fails because the model is excluded or unavailable, retry once with model: \"${resolution.fallback.model}\" and thinking: \"${resolution.fallback.effectiveThinking}\".` : ""}`
     : "";
   const routing = role === "orchestrator"
     ? "Coordinate the task through Agent calls. Use the MCP agent types and role routing below only as needed. Do not perform task work in main."
@@ -447,7 +822,11 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
     ? SET_ROLES.filter((profileRole) => profileRole !== "orchestrate").map((profileRole) => {
       const logicalRole = Object.entries(ROLE_PROFILE_KEYS).find(([, key]) => key === profileRole)?.[0];
       const options = resolution.roles[profileRole];
-      return `${logicalRole}: subagent_type=${ROLE_AGENT_TYPES[logicalRole]}, model=${options.model}, thinking=off, requested_reasoning=${options.reasoning}`;
+      const thinking = effectiveThinking(options.model, options.reasoning, config);
+      const fallback = options.fallback
+        ? `, fallback_model=${options.fallback.model}, fallback_thinking=${effectiveThinking(options.fallback.model, options.fallback.reasoning, config)}`
+        : "";
+      return `${logicalRole}: subagent_type=${ROLE_AGENT_TYPES[logicalRole]}, model=${options.model}, thinking=${thinking}, requested_reasoning=${options.reasoning}${fallback}`;
     })
     : [];
 
@@ -460,6 +839,11 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
     `ROLE_MODEL: ${resolution.model || "agent profile default"}`,
     `ROLE_REASONING_REQUESTED: ${resolution.requestedReasoning || "unspecified"}`,
     `ROLE_THINKING_EFFECTIVE: ${resolution.effectiveThinking}`,
+    ...(resolution.fallback ? [
+      `ROLE_FALLBACK_MODEL: ${resolution.fallback.model}`,
+      `ROLE_FALLBACK_REASONING_REQUESTED: ${resolution.fallback.reasoning || "unspecified"}`,
+      `ROLE_FALLBACK_THINKING_EFFECTIVE: ${resolution.fallback.effectiveThinking}`,
+    ] : []),
     ...(setRouting.length ? ["SET_ROLE_ROUTING:", ...setRouting] : []),
     "",
     `TASK_ID: ${taskId}`,
@@ -687,7 +1071,7 @@ function commonProperties(includePaths) {
     reasoning: {
       type: "string",
       enum: [...REASONING_LEVELS],
-      description: "Requested reasoning level; current Pi LiteLLM models clamp effective thinking to off.",
+      description: "Requested reasoning level; models without reasoning support use off.",
     },
     background: { type: "boolean", description: "Run the delegation in the background and return immediately with a run ID." },
   };
@@ -717,7 +1101,22 @@ function tool(name, description, role, writer = false) {
   };
 }
 
+function routeTool() {
+  return {
+    name: "pi_route",
+    description: "Route a task through the most appropriate Pi specialist. Jev may choose the initial role only when enabled.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: commonProperties(true),
+      required: ["task"],
+    },
+    role: "route",
+  };
+}
+
 export const TOOL_DEFINITIONS = [
+  routeTool(),
   tool("pi_orchestrate", "Coordinate a multi-phase Pi workflow through specialist agents.", "orchestrator", true),
   tool("pi_research", "Delegate read-only repository research or diagnosis to Pi researcher.", "researcher"),
   tool("pi_implement", "Delegate a bounded implementation to Pi coder. Requires strict relative write paths.", "coder", true),
@@ -831,12 +1230,56 @@ function activityEntries(config, args) {
   return { logPath, entries };
 }
 
+function nativeRunStatus(entry) {
+  const runDir = entry.async_dir;
+  const id = entry.subagent_id;
+  if (typeof runDir !== "string" || typeof id !== "string" || !isAbsolute(runDir)
+    || basename(runDir) !== id || basename(dirname(runDir)) !== "async-subagent-runs") return null;
+  try {
+    const state = JSON.parse(readFileSync(resolve(runDir, "status.json"), "utf8")).state;
+    if (state === "running" || state === "queued") return "running";
+    if (state !== "complete") return state === "partial" ? "partial" : "blocked";
+    try {
+      const outputPath = resolve(runDir, "output-0.log");
+      const output = statSync(outputPath).size <= 1_000_000 ? readFileSync(outputPath, "utf8") : "";
+      return delegatedTaskStatus(output) ?? "partial";
+    } catch {
+      return "partial";
+    }
+  } catch {
+    return null;
+  }
+}
+
+function logNativeRunStart(config, { id, asyncDir, taskId, agent }) {
+  try {
+    const logDir = process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs");
+    mkdirSync(logDir, { recursive: true });
+    appendFileSync(resolve(logDir, "pi-agents.jsonl"), `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "subagent_async_started",
+      subagent_id: id,
+      task_id: taskId,
+      agent,
+      async_dir: asyncDir,
+      status: "started",
+    })}\n`);
+  } catch (error) {
+    process.stderr.write(`[pi-delegator] Activity log warning: ${String(error)}\n`);
+  }
+}
+
 export function activity(args = {}, config = createConfig()) {
   const limit = integer(args.limit, 20, 1, MAX_ACTIVITY_EVENTS);
   const { logPath, entries } = activityEntries(config, args);
   const activeBySession = new Map();
+  const activeNativeRuns = new Map();
   for (const entry of entries) {
-    if (entry.event === "pixel_agent_session_started" && entry.session_id) {
+    if (entry.event === "subagent_async_started" && entry.subagent_id) {
+      activeNativeRuns.set(entry.subagent_id, entry);
+    } else if (entry.event === "subagent_async_completed" && entry.subagent_id) {
+      activeNativeRuns.delete(entry.subagent_id);
+    } else if (entry.event === "pixel_agent_session_started" && entry.session_id) {
       activeBySession.set(entry.session_id, entry);
     } else if (!entry.event || entry.event === "subagent_interrupted") {
       if (entry.session_id) {
@@ -848,6 +1291,9 @@ export function activity(args = {}, config = createConfig()) {
       );
       if (legacySession) activeBySession.delete(legacySession[0]);
     }
+  }
+  for (const [id, entry] of activeNativeRuns) {
+    if (nativeRunStatus(entry) !== "running") activeNativeRuns.delete(id);
   }
   const activeStatePath = resolve(dirname(logPath), "pixel-agents-active-sessions.json");
   if (existsSync(activeStatePath)) {
@@ -865,15 +1311,18 @@ export function activity(args = {}, config = createConfig()) {
   }
   const payload = {
     log_path: logPath,
-    active_count: activeBySession.size,
+    active_count: activeBySession.size + activeNativeRuns.size,
     active_state_stale_after_ms: ACTIVE_SESSION_STALE_MS,
-    active: [...activeBySession.values()].map((entry) => ({
+    active: [...activeBySession.values(), ...activeNativeRuns.values()].map((entry) => ({
       session_id: entry.session_id,
+      subagent_id: entry.subagent_id,
       task_id: entry.task_id ?? null,
       agent: entry.agent ?? null,
       started_at: entry.timestamp ?? null,
     })),
-    recent: entries.slice(-limit),
+    recent: entries.slice(-limit).map((entry) => entry.event === "subagent_async_started"
+      ? { ...entry, status: nativeRunStatus(entry) ?? entry.status }
+      : entry),
   };
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
 }
@@ -888,7 +1337,7 @@ export function delegationSets(config = createConfig()) {
         semantics: {
           requested_percentage: "Target share of eligible supervisor work delegated across the wider task.",
           successful_percentage_for_this_unit: "100 only when this MCP unit returns COMPLETED; otherwise 0.",
-          effective_thinking: "off because current LiteLLM model catalog declares reasoning=false.",
+          effective_thinking: "Requested level when the selected LiteLLM model supports reasoning; otherwise off.",
         },
       }, null, 2),
     }],
@@ -932,6 +1381,75 @@ export function status(config = createConfig()) {
 }
 
 const rpcHosts = new Map();
+
+function runIdFromSpawn(data) {
+  const id = data?.details?.asyncId ?? data?.details?.runId;
+  if (typeof id !== "string" || !id) throw new Error("Pi RPC spawn returned no async run ID");
+  return id;
+}
+
+function readRunOutputFromStatus(statusText, id) {
+  const runDir = /^Dir: (.+)$/m.exec(statusText)?.[1];
+  const outputPath = /^Output: (.+)$/m.exec(statusText)?.[1];
+  if (!runDir || !outputPath || !isAbsolute(runDir) || !isAbsolute(outputPath)) return null;
+  if (basename(runDir) !== id || basename(dirname(runDir)) !== "async-subagent-runs") return null;
+  try {
+    const realDir = realpathSync(runDir);
+    const realOutput = realpathSync(outputPath);
+    const pathWithinRun = relative(realDir, realOutput);
+    if (!pathWithinRun || pathWithinRun === ".." || pathWithinRun.startsWith(`..${sep}`) || isAbsolute(pathWithinRun)) return null;
+    if (statSync(realOutput).size > 1_000_000) return null;
+    return readFileSync(realOutput, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+function delegatedTaskStatus(output) {
+  const matches = [...output.matchAll(/^STATUS:\s*(COMPLETED|PARTIAL|BLOCKED)\s*$/gim)];
+  return matches.length ? matches.at(-1)[1].toLowerCase() : null;
+}
+
+export async function waitForRun(host, id, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const remainingBeforeRequest = deadline - Date.now();
+    if (remainingBeforeRequest <= 0) return { id, status: "running" };
+    let data;
+    try {
+      data = await host.request("status", { id }, {
+        timeoutMs: Math.min(10_000, remainingBeforeRequest),
+        restartOnFailure: false,
+      });
+    } catch (error) {
+      if (/timed out/.test(String(error))) {
+        return { id, status: "running", reason: "Pi RPC status did not respond within the wait window" };
+      }
+      throw error;
+    }
+    const state = /^State: ([^\r\n]+)/m.exec(String(data?.text ?? ""))?.[1];
+    if (!state) throw new Error(`Pi RPC status returned no state for run ${id}`);
+    if (state !== "running" && state !== "queued") {
+      const statusText = String(data.text ?? "");
+      const output = state === "complete" ? readRunOutputFromStatus(statusText, id) : null;
+      const taskStatus = state === "complete"
+        ? delegatedTaskStatus(output ?? statusText) ?? "partial"
+        : state === "partial" ? "partial" : "blocked";
+      return {
+        id,
+        status: taskStatus,
+        result: {
+          kind: "text",
+          text: output ?? statusText,
+          statusText,
+        },
+      };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return { id, status: "running" };
+    await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, remaining)));
+  }
+}
 
 async function getRpcHost(config) {
   let host = rpcHosts.get(config);
@@ -985,6 +1503,73 @@ const RUN_CONTROL_METHODS = {
   pi_run_resume: "resume",
 };
 
+async function spawnDelegation(host, definition, args, config, token, route = {}) {
+  void token;
+  const role = route.role || definition.role;
+  const resolution = route.resolution || resolveDelegationOptions(role, args, config);
+  const taskId = makeTaskId(args.task_id);
+  const writer = WRITER_ROLES.has(role);
+  const allowedPaths = writer
+    ? normalizeAllowedPaths(args.allowed_paths ?? [], config.root, true)
+    : [];
+  const decisionLines = [];
+  for (const [name, decision] of Object.entries(route.decisions ?? {})) {
+    if (!decision) continue;
+    decisionLines.push(`JEV_${name.toUpperCase()}_MODE: ${decision.mode}`);
+    decisionLines.push(`JEV_${name.toUpperCase()}_RECOMMENDATION: ${decision.recommendation?.choice || "none"}`);
+    decisionLines.push(`JEV_${name.toUpperCase()}_APPLIED: ${decision.applied ? "yes" : "no"}`);
+    if (decision.fallbackCode) decisionLines.push(`JEV_${name.toUpperCase()}_FALLBACK: ${decision.fallbackCode}`);
+  }
+  const task = [
+    `TASK_ID: ${taskId}`,
+    `OBJECTIVE: ${cleanText(args.task, "task", true)}`,
+    `SCOPE: ${cleanText(args.scope, "scope") || "Only the explicitly requested task."}`,
+    `CONSTRAINTS: ${cleanText(args.constraints, "constraints") || "Follow repository instructions and report evidence."}`,
+    `EXPECTED_OUTPUT: ${cleanText(args.expected_output, "expected_output") || "Evidence and terminal status."}`,
+    ...(route.sourceTool ? [`ROUTED_FROM: ${route.sourceTool}`, `ROUTED_ROLE: ${role}`] : []),
+    ...(route.researchBeforeWriting ? [`WORKFLOW: Delegate research first; use its findings as context for the ${route.plannedWriterRole} task, then complete the requested work.`] : []),
+    ...(route.decisions?.additional_review_focus?.applied && route.decisions.additional_review_focus.recommendation.choice !== "none"
+      ? [`REVIEW_FOCUS: Delegate a reviewer after the work and ask it to focus on ${route.decisions.additional_review_focus.recommendation.choice}.`]
+      : []),
+    ...decisionLines,
+    `DELEGATION_SET: ${resolution.set ?? "none"}`,
+    `DELEGATION_PERCENTAGE_TARGET: ${resolution.percentage ?? "unspecified"}`,
+    `ROLE_REASONING_REQUESTED: ${resolution.requestedReasoning || "unspecified"}`,
+    ...(role === "orchestrator" && resolution.roles
+      ? [`ROLE_ROUTING: ${Object.entries(resolution.roles).map(([profileRole, options]) => `${profileRole}=${options.model}:${options.reasoning}`).join(", ")}`]
+      : []),
+    writer
+      ? `STRICT WRITE SCOPE: ${allowedPaths.join(", ")}. Do not modify other paths.`
+      : "READ-ONLY: Do not create, edit, move, or delete files.",
+  ].join("\n");
+  const spawnParams = {
+    agent: ROLE_AGENT_TYPES[role],
+    task,
+    model: `${resolution.model}:${resolution.effectiveThinking}`,
+    context: "fresh",
+  };
+  const run = await host.request("spawn", spawnParams);
+  const runId = runIdFromSpawn(run);
+  logNativeRunStart(config, {
+    id: runId,
+    asyncDir: run.details?.asyncDir,
+    taskId,
+    agent: ROLE_AGENT_TYPES[role],
+  });
+  const modelLine = `${resolution.model}:${resolution.effectiveThinking}`;
+  const routeLine = route.sourceTool ? `\nTASK_ID: ${taskId}\nROLE: ${role}` : "";
+  if (args.background === true) {
+    return { content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}${routeLine}\nSTATUS: PARTIAL` }], isError: false };
+  }
+  const waited = await waitForRun(host, runId, (args.timeout_seconds ?? config.timeoutSeconds) * 1000);
+  const statusLine = waited.status === "completed" ? "COMPLETED" : waited.status === "running" || waited.status === "partial" ? "PARTIAL" : "BLOCKED";
+  const resultText = waited.result?.text ?? waited.reason ?? "Run is still active.";
+  return {
+    content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}${routeLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],
+    isError: statusLine === "BLOCKED",
+  };
+}
+
 export async function callTool(name, args = {}, config = createConfig(), token = null) {
   const definition = TOOL_DEFINITIONS.find((candidate) => candidate.name === name);
   if (!definition) throw new Error(`Unknown tool: ${name}`);
@@ -998,28 +1583,41 @@ export async function callTool(name, args = {}, config = createConfig(), token =
     const params = controlMethod === "status" ? {} : { id: args.id };
     if (controlMethod === "steer" || controlMethod === "resume") params.message = args.message;
     if (controlMethod === "wait" && args.timeout_ms !== undefined) params.timeout_ms = args.timeout_ms;
-    const data = await host.request(controlMethod, params);
+    const data = controlMethod === "wait"
+      ? await waitForRun(host, params.id, args.timeout_ms ?? config.timeoutSeconds * 1000)
+      : await host.request(controlMethod, params);
     return { content: [{ type: "text", text: JSON.stringify(data) }], isError: false };
   }
-  void token;
-  const resolution = resolveDelegationOptions(definition.role, args, config);
-  const spawnParams = { model: resolution.model, thinking: resolution.effectiveThinking };
-  if (WRITER_ROLES.has(definition.role)) {
-    const allowedPaths = normalizeAllowedPaths(args.allowed_paths ?? [], config.root, true);
-    if (allowedPaths.length) spawnParams.paths = allowedPaths;
+  args = { ...args, task_id: makeTaskId(args.task_id) };
+  const budget = { remaining: loadJevConfig(config).maxCallsPerTask };
+  if (definition.role === "route") {
+    const routed = await selectRouteRole(args, config, budget);
+    const phased = await applyRoutePhaseDecisions(args, config, routed.role, budget);
+    if (phased.blocked) {
+      return { content: [{ type: "text", text: `TASK_ID: ${args.task_id}\n${phased.blocked.text}` }], isError: false };
+    }
+    if (WRITER_ROLES.has(phased.role) && (!Array.isArray(args.allowed_paths) || args.allowed_paths.length === 0)) {
+      return {
+        content: [{ type: "text", text: `TASK_ID: ${args.task_id}\nSTATUS: BLOCKED\nREASON: pi_route selected ${phased.role}, but allowed_paths is required before launching a writer.\nJEV_INITIAL_ROLE_RECOMMENDATION: ${routed.decision.recommendation?.choice || "none"}` }],
+        isError: true,
+      };
+    }
+    const { resolution, decision: setDecision } = await resolveDelegationOptionsWithJev(phased.role, args, config, budget);
+    return spawnDelegation(host, definition, args, config, token, {
+      role: phased.role,
+      resolution,
+      sourceTool: "pi_route",
+      researchBeforeWriting: phased.researchBeforeWriting,
+      plannedWriterRole: phased.plannedWriterRole,
+      decisions: { initial_role: routed.decision, ...phased.decisions, delegation_set: setDecision },
+    });
   }
-  const run = await host.request("spawn", spawnParams);
-  const modelLine = `${resolution.model}:${resolution.effectiveThinking}`;
-  if (args.background === true) {
-    return { content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: PARTIAL` }], isError: false };
-  }
-  const waited = await host.request("wait", { id: run.id });
-  const statusLine = String(waited.status || "completed").toUpperCase();
-  const resultText = waited.result?.text ?? "";
-  return {
-    content: [{ type: "text", text: `RUN_ID: ${run.id}\nMODEL: ${modelLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],
-    isError: false,
-  };
+  const { resolution, decision } = await resolveDelegationOptionsWithJev(definition.role, args, config, budget);
+  return spawnDelegation(host, definition, args, config, token, {
+    role: definition.role,
+    resolution,
+    decisions: { delegation_set: decision },
+  });
 }
 
 function send(message) {
@@ -1064,6 +1662,7 @@ async function handleMessage(message, config) {
 
 export function main(config = createConfig()) {
   if (!existsSync(config.root)) throw new Error(`PI_MCP_ALLOWED_ROOT does not exist: ${config.root}`);
+  loadJevConfig(config);
   const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   input.on("line", (line) => {
     if (!line.trim()) return;
