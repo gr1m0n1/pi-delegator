@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { basename, delimiter, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -843,12 +843,56 @@ function activityEntries(config, args) {
   return { logPath, entries };
 }
 
+function nativeRunStatus(entry) {
+  const runDir = entry.async_dir;
+  const id = entry.subagent_id;
+  if (typeof runDir !== "string" || typeof id !== "string" || !isAbsolute(runDir)
+    || basename(runDir) !== id || basename(dirname(runDir)) !== "async-subagent-runs") return null;
+  try {
+    const state = JSON.parse(readFileSync(resolve(runDir, "status.json"), "utf8")).state;
+    if (state === "running" || state === "queued") return "running";
+    if (state !== "complete") return state === "partial" ? "partial" : "blocked";
+    try {
+      const outputPath = resolve(runDir, "output-0.log");
+      const output = statSync(outputPath).size <= 1_000_000 ? readFileSync(outputPath, "utf8") : "";
+      return delegatedTaskStatus(output) ?? "partial";
+    } catch {
+      return "partial";
+    }
+  } catch {
+    return null;
+  }
+}
+
+function logNativeRunStart(config, { id, asyncDir, taskId, agent }) {
+  try {
+    const logDir = process.env.PI_AGENT_LOG_DIR || resolve(config.runtimeRoot, "logs");
+    mkdirSync(logDir, { recursive: true });
+    appendFileSync(resolve(logDir, "pi-agents.jsonl"), `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event: "subagent_async_started",
+      subagent_id: id,
+      task_id: taskId,
+      agent,
+      async_dir: asyncDir,
+      status: "started",
+    })}\n`);
+  } catch (error) {
+    process.stderr.write(`[pi-delegator] Activity log warning: ${String(error)}\n`);
+  }
+}
+
 export function activity(args = {}, config = createConfig()) {
   const limit = integer(args.limit, 20, 1, MAX_ACTIVITY_EVENTS);
   const { logPath, entries } = activityEntries(config, args);
   const activeBySession = new Map();
+  const activeNativeRuns = new Map();
   for (const entry of entries) {
-    if (entry.event === "pixel_agent_session_started" && entry.session_id) {
+    if (entry.event === "subagent_async_started" && entry.subagent_id) {
+      activeNativeRuns.set(entry.subagent_id, entry);
+    } else if (entry.event === "subagent_async_completed" && entry.subagent_id) {
+      activeNativeRuns.delete(entry.subagent_id);
+    } else if (entry.event === "pixel_agent_session_started" && entry.session_id) {
       activeBySession.set(entry.session_id, entry);
     } else if (!entry.event || entry.event === "subagent_interrupted") {
       if (entry.session_id) {
@@ -860,6 +904,9 @@ export function activity(args = {}, config = createConfig()) {
       );
       if (legacySession) activeBySession.delete(legacySession[0]);
     }
+  }
+  for (const [id, entry] of activeNativeRuns) {
+    if (nativeRunStatus(entry) !== "running") activeNativeRuns.delete(id);
   }
   const activeStatePath = resolve(dirname(logPath), "pixel-agents-active-sessions.json");
   if (existsSync(activeStatePath)) {
@@ -877,15 +924,18 @@ export function activity(args = {}, config = createConfig()) {
   }
   const payload = {
     log_path: logPath,
-    active_count: activeBySession.size,
+    active_count: activeBySession.size + activeNativeRuns.size,
     active_state_stale_after_ms: ACTIVE_SESSION_STALE_MS,
-    active: [...activeBySession.values()].map((entry) => ({
+    active: [...activeBySession.values(), ...activeNativeRuns.values()].map((entry) => ({
       session_id: entry.session_id,
+      subagent_id: entry.subagent_id,
       task_id: entry.task_id ?? null,
       agent: entry.agent ?? null,
       started_at: entry.timestamp ?? null,
     })),
-    recent: entries.slice(-limit),
+    recent: entries.slice(-limit).map((entry) => entry.event === "subagent_async_started"
+      ? { ...entry, status: nativeRunStatus(entry) ?? entry.status }
+      : entry),
   };
   return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
 }
@@ -968,6 +1018,11 @@ function readRunOutputFromStatus(statusText, id) {
   }
 }
 
+function delegatedTaskStatus(output) {
+  const matches = [...output.matchAll(/^STATUS:\s*(COMPLETED|PARTIAL|BLOCKED)\s*$/gim)];
+  return matches.length ? matches.at(-1)[1].toLowerCase() : null;
+}
+
 export async function waitForRun(host, id, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (true) {
@@ -988,13 +1043,18 @@ export async function waitForRun(host, id, timeoutMs) {
     const state = /^State: ([^\r\n]+)/m.exec(String(data?.text ?? ""))?.[1];
     if (!state) throw new Error(`Pi RPC status returned no state for run ${id}`);
     if (state !== "running" && state !== "queued") {
+      const statusText = String(data.text ?? "");
+      const output = state === "complete" ? readRunOutputFromStatus(statusText, id) : null;
+      const taskStatus = state === "complete"
+        ? delegatedTaskStatus(output ?? statusText) ?? "partial"
+        : state === "partial" ? "partial" : "blocked";
       return {
         id,
-        status: state === "complete" ? "completed" : state,
+        status: taskStatus,
         result: {
           kind: "text",
-          text: state === "complete" ? readRunOutputFromStatus(String(data.text ?? ""), id) ?? String(data.text ?? "") : String(data.text ?? ""),
-          statusText: String(data.text ?? ""),
+          text: output ?? statusText,
+          statusText,
         },
       };
     }
@@ -1104,12 +1164,18 @@ export async function callTool(name, args = {}, config = createConfig(), token =
   };
   const run = await host.request("spawn", spawnParams);
   const runId = runIdFromSpawn(run);
+  logNativeRunStart(config, {
+    id: runId,
+    asyncDir: run.details?.asyncDir,
+    taskId,
+    agent: ROLE_AGENT_TYPES[definition.role],
+  });
   const modelLine = `${resolution.model}:${resolution.effectiveThinking}`;
   if (args.background === true) {
     return { content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}\nSTATUS: PARTIAL` }], isError: false };
   }
   const waited = await waitForRun(host, runId, (args.timeout_seconds ?? config.timeoutSeconds) * 1000);
-  const statusLine = waited.status === "completed" ? "COMPLETED" : waited.status === "running" ? "PARTIAL" : "BLOCKED";
+  const statusLine = waited.status === "completed" ? "COMPLETED" : waited.status === "running" || waited.status === "partial" ? "PARTIAL" : "BLOCKED";
   const resultText = waited.result?.text ?? waited.reason ?? "Run is still active.";
   return {
     content: [{ type: "text", text: `RUN_ID: ${runId}\nMODEL: ${modelLine}\nSTATUS: ${statusLine}\n\n${resultText}` }],

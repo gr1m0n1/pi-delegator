@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 type ActivityEvent = {
   timestamp?: string;
@@ -11,6 +11,7 @@ type ActivityEvent = {
   status?: string;
   duration_ms?: number;
   subagent_id?: string;
+  async_dir?: string;
 };
 
 type ActivitySnapshot = {
@@ -65,29 +66,35 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
     }
     if (label === "Recent") {
       const activeSessions = new Set(this.snapshot.active.map((entry) => entry.session_id).filter(Boolean));
+      const activeSubagents = new Set(this.snapshot.active.map((entry) => entry.subagent_id).filter(Boolean));
       const activeTasks = new Set(
         this.snapshot.active
           .map((entry) => activityKey(entry))
           .filter(Boolean),
       );
-      const completedSessions = new Set(
-        this.snapshot.recent
-          .filter((entry) => isTerminalEvent(entry))
-          .flatMap((entry) => [entry.session_id, activityKey(entry)])
-          .filter(Boolean),
-      );
+      const terminalStatuses = new Map<string, string>();
+      for (const entry of this.snapshot.recent) {
+        if (!isTerminalEvent(entry)) continue;
+        const status = entry.status || (entry.event === "subagent_async_completed" ? "completed" : "interrupted");
+        for (const key of terminalKeys(entry)) {
+          if (key) terminalStatuses.set(key, status);
+        }
+      }
       return this.snapshot.recent.slice().reverse().map((entry) => {
+        const keys = terminalKeys(entry);
         const key = activityKey(entry);
-        const running = entry.event === "pixel_agent_session_started"
+        const started = entry.event === "pixel_agent_session_started" || entry.event === "subagent_async_started";
+        const running = started
           && Boolean(
-            (entry.session_id && activeSessions.has(entry.session_id) || key && activeTasks.has(key))
-            && !completedSessions.has(entry.session_id)
-            && !completedSessions.has(key),
+            (entry.event === "subagent_async_started"
+              ? entry.subagent_id && activeSubagents.has(entry.subagent_id)
+              : entry.session_id ? activeSessions.has(entry.session_id) : key && activeTasks.has(key))
+            && !keys.some((key) => terminalStatuses.has(key)),
           );
         const status = running
           ? "running"
-          : entry.event === "pixel_agent_session_started"
-            ? "completed"
+          : started
+            ? keys.map((key) => terminalStatuses.get(key)).find(Boolean) || "unknown"
             : entry.status || entry.event || "updated";
         return this.agentItem(entry, status);
       });
@@ -134,12 +141,20 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
     } catch {
       return { logPath, runtimeRoot, active: [], recent: [] };
     }
+    entries = entries.flatMap((entry) => {
+      if (entry.event !== "subagent_async_started") return [entry];
+      const terminal = nativeRunTerminal(entry);
+      return terminal ? [entry, { ...entry, event: "subagent_async_completed", ...terminal }] : [entry];
+    });
     const activeBySession = new Map<string, ActivityEvent>();
     for (const entry of entries) {
       if (entry.event === "pixel_agent_session_started" && entry.session_id) activeBySession.set(entry.session_id, entry);
       if (entry.event === "subagent_async_started" && entry.subagent_id) activeBySession.set(`async:${entry.subagent_id}`, entry);
       else if (entry.event === "subagent_async_completed" && entry.subagent_id) activeBySession.delete(`async:${entry.subagent_id}`);
-      else if ((!entry.event || entry.event === "subagent_interrupted") && entry.session_id) activeBySession.delete(entry.session_id);
+      else if (isTerminalEvent(entry)) {
+        if (entry.session_id) activeBySession.delete(entry.session_id);
+        if (entry.subagent_id) activeBySession.delete(`async:${entry.subagent_id}`);
+      }
     }
     let activeIds: Set<unknown> | undefined;
     let stateIsStale = true;
@@ -153,8 +168,9 @@ class ActivityProvider implements vscode.TreeDataProvider<ActivityItem> {
       // Older runtimes do not yet persist an authoritative active-session file.
     }
     for (const [key, entry] of [...activeBySession.entries()]) {
-      const sessionId = key.startsWith("async:") ? entry.session_id : key;
-      const observed = activeIds && !stateIsStale && sessionId ? activeIds.has(sessionId) : isRecentEvent(entry);
+      const observed = key.startsWith("async:")
+        ? nativeRunState(entry) === "running" || isRecentEvent(entry)
+        : activeIds && !stateIsStale ? activeIds.has(key) : isRecentEvent(entry);
       if (!observed) activeBySession.delete(key);
     }
     return { logPath, runtimeRoot, active: [...activeBySession.values()], recent: entries.slice(-50) };
@@ -165,6 +181,44 @@ function activityKey(entry: ActivityEvent): string | undefined {
   return entry.task_id && entry.agent ? `${entry.task_id}:${entry.agent}` : undefined;
 }
 
+function nativeRunState(entry: ActivityEvent): string | undefined {
+  const runDir = entry.async_dir;
+  if (!runDir || !entry.subagent_id || !isAbsolute(runDir)
+    || basename(runDir) !== entry.subagent_id || basename(dirname(runDir)) !== "async-subagent-runs") return undefined;
+  try {
+    const state = JSON.parse(readFileSync(resolve(runDir, "status.json"), "utf8"));
+    return typeof state.state === "string" ? state.state : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeRunTerminal(entry: ActivityEvent): Pick<ActivityEvent, "status" | "timestamp"> | undefined {
+  const state = nativeRunState(entry);
+  if (!state || state === "running" || state === "queued") return undefined;
+  let status = state === "partial" ? "partial" : "blocked";
+  if (state === "complete") {
+    status = "partial";
+    try {
+      const outputPath = resolve(entry.async_dir!, "output-0.log");
+      const output = statSync(outputPath).size <= 1_000_000 ? readFileSync(outputPath, "utf8") : "";
+      const matches = [...output.matchAll(/^STATUS:\s*(COMPLETED|PARTIAL|BLOCKED)\s*$/gim)];
+      if (matches.length) status = matches.at(-1)![1].toLowerCase();
+    } catch {
+      // A finished process without a readable task result remains partial.
+    }
+  }
+  return { status, timestamp: new Date().toISOString() };
+}
+
+function terminalKeys(entry: ActivityEvent): string[] {
+  if (entry.event === "subagent_async_started" || entry.event === "subagent_async_completed") {
+    return entry.subagent_id ? [`async:${entry.subagent_id}`] : [];
+  }
+  const key = entry.session_id || activityKey(entry);
+  return key ? [key] : [];
+}
+
 function isRecentEvent(entry: ActivityEvent): boolean {
   const timestamp = Date.parse(String(entry.timestamp ?? ""));
   return Number.isFinite(timestamp) && Date.now() - timestamp <= activeSessionStaleMs;
@@ -172,6 +226,7 @@ function isRecentEvent(entry: ActivityEvent): boolean {
 
 function isTerminalEvent(entry: ActivityEvent): boolean {
   return entry.event === "subagent_interrupted"
+    || entry.event === "subagent_async_completed"
     || !entry.event && ["completed", "partial", "failed", "blocked", "cancelled", "aborted", "stopped"].includes(String(entry.status).toLowerCase());
 }
 

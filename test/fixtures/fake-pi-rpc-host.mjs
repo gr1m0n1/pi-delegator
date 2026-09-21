@@ -18,7 +18,7 @@ input.on("line", (line) => {
     reply(request.requestId, { text: "Async: researcher-mcp [fixture-run]", details: { asyncId: "fixture-run" } });
   } else if (request.method === "status") {
     reply(request.requestId, request.params.id
-      ? { text: "Run: fixture-run\nState: complete\n\nfixture complete", details: { mode: "single", results: [] } }
+      ? { text: "Run: fixture-run\nState: complete\n\nfixture complete\nSTATUS: COMPLETED", details: { mode: "single", results: [] } }
       : { text: "Run: fixture-run", runs: [{ id: "fixture-run", status: "completed" }] });
   } else if (request.method === "stop") {
     reply(request.requestId, { id: request.params.id, status: "stopped" });

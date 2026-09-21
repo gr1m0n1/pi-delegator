@@ -4,10 +4,10 @@
     "default": {
       "delegation_percentage": 50,
       "roles": {
-        "research": { "model": "llm-medium", "reasoning": "off" },
+        "research": { "model": "llm-medium", "reasoning": "none" },
         "implement": { "model": "llm-large", "reasoning": "xhigh" },
-        "tests": { "model": "llm-medium", "reasoning": "off" },
-        "review": { "model": "llm-medium", "reasoning": "off" },
+        "tests": { "model": "llm-medium", "reasoning": "none" },
+        "review": { "model": "llm-medium", "reasoning": "none" },
         "orchestrate": { "model": "llm-large", "reasoning": "xhigh" }
       }
     },

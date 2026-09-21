@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   TOOL_DEFINITIONS,
+  activity,
   callTool,
   createConfig,
   loadDelegationSets,
@@ -62,7 +63,7 @@ function fixtureConfig() {
   };
 }
 
-function fakeRpcHostScript(directory) {
+function fakeRpcHostScript(directory, terminalStatus = "COMPLETED") {
   const script = join(directory, "fake-mcp-rpc-host.mjs");
   writeFileSync(script, `
 import readline from "node:readline";
@@ -81,7 +82,7 @@ input.on("line", (line) => {
     reply(request.requestId, { text: "Async: researcher-mcp [run-native-1]", details: { asyncId: "run-native-1" } });
   }
   else if (request.method === "status") reply(request.requestId, request.params.id
-    ? { text: "Run: run-native-1\\nState: complete\\n\\nnative done", details: { mode: "single", results: [] } }
+    ? { text: "Run: run-native-1\\nState: complete\\n\\nnative done\\nSTATUS: ${terminalStatus}", details: { mode: "single", results: [] } }
     : { text: "Run: run-native-1", runs: [{ id: "run-native-1", status: "completed" }] });
   else reply(request.requestId, { id: request.params.id, status: request.method === "stop" ? "stopped" : "delivered" });
 });
@@ -180,18 +181,62 @@ test("callTool routes foreground delegation through native wait", async () => {
   }
 });
 
+test("foreground delegation reports partial and blocked child outcomes", async () => {
+  for (const [reported, isError] of [["PARTIAL", false], ["BLOCKED", true]]) {
+    const config = fixtureConfig();
+    config.rpcArgs = [fakeRpcHostScript(config.root, reported)];
+    try {
+      const result = await callTool("pi_review", { task: "Review README" }, config);
+      assert.equal(result.isError, isError);
+      assert.match(result.content[0].text, new RegExp(`^STATUS: ${reported}$`, "m"));
+    } finally {
+      await shutdownRpcHost(config);
+    }
+  }
+});
+
 test("native wait returns the completed child output", async () => {
   const config = fixtureConfig();
   const id = "run-native-output";
   const runDir = join(config.root, "async-subagent-runs", id);
   mkdirSync(runDir, { recursive: true });
   const outputPath = join(runDir, "output-0.log");
-  writeFileSync(outputPath, "PI_DELEGATION_OK\n");
+  writeFileSync(outputPath, "PI_DELEGATION_OK\nSTATUS: COMPLETED\n");
   const statusText = `Run: ${id}\nState: complete\nDir: ${runDir}\nOutput: ${outputPath}`;
   const result = await waitForRun({ request: async () => ({ text: statusText }) }, id, 1000);
   assert.equal(result.status, "completed");
-  assert.equal(result.result.text, "PI_DELEGATION_OK");
+  assert.equal(result.result.text, "PI_DELEGATION_OK\nSTATUS: COMPLETED");
   assert.equal(result.result.statusText, statusText);
+});
+
+test("native wait respects the delegated task's terminal status", async () => {
+  for (const [reported, expected] of [["PARTIAL", "partial"], ["BLOCKED", "blocked"]]) {
+    const result = await waitForRun({ request: async () => ({ text: `State: complete\nSTATUS: ${reported}` }) }, "run-native-status", 1000);
+    assert.equal(result.status, expected);
+  }
+  const missing = await waitForRun({ request: async () => ({ text: "State: complete\nOutput unavailable" }) }, "run-native-status", 1000);
+  assert.equal(missing.status, "partial");
+});
+
+test("activity reconciles native async runs with their status artifact", () => {
+  const config = fixtureConfig();
+  const id = "run-native-activity";
+  const runDir = join(config.root, "async-subagent-runs", id);
+  const logDir = join(config.root, "logs");
+  mkdirSync(runDir, { recursive: true });
+  mkdirSync(logDir, { recursive: true });
+  writeFileSync(join(logDir, "pi-agents.jsonl"), `${JSON.stringify({
+    timestamp: new Date().toISOString(), event: "subagent_async_started", subagent_id: id,
+    task_id: "TASK-ACTIVITY", agent: "researcher-mcp", async_dir: runDir, status: "started",
+  })}\n`);
+  writeFileSync(join(runDir, "status.json"), JSON.stringify({ state: "running" }));
+  let snapshot = JSON.parse(activity({ task_id: "TASK-ACTIVITY" }, config).content[0].text);
+  assert.equal(snapshot.active_count, 1);
+  writeFileSync(join(runDir, "output-0.log"), "STATUS: PARTIAL\n");
+  writeFileSync(join(runDir, "status.json"), JSON.stringify({ state: "complete" }));
+  snapshot = JSON.parse(activity({ task_id: "TASK-ACTIVITY" }, config).content[0].text);
+  assert.equal(snapshot.active_count, 0);
+  assert.equal(snapshot.recent.at(-1).status, "partial");
 });
 
 test("callTool exposes native run status control", async () => {
