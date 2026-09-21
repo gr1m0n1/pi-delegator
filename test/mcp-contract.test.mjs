@@ -10,6 +10,7 @@ import {
   buildPrompt,
   callTool,
   createConfig,
+  loadJevConfig,
   loadDelegationSets,
   normalizeAllowedPaths,
   resolveDelegationOptions,
@@ -39,6 +40,16 @@ function fixtureConfig() {
           orchestrate: { model: "llm-large", reasoning: "high" },
         },
       },
+      fast: {
+        delegation_percentage: 75,
+        roles: {
+          research: { model: "llm-large", reasoning: "high" },
+          implement: { model: "llm-medium-devel", reasoning: "low" },
+          tests: { model: "llm-medium", reasoning: "low" },
+          review: { model: "llm-medium", reasoning: "low" },
+          orchestrate: { model: "llm-large", reasoning: "low" },
+        },
+      },
     },
   }));
   return {
@@ -61,6 +72,9 @@ function fixtureConfig() {
     repoVerityEnabled: false,
     repoVerityRequired: false,
     repoVerityAvailability: "disabled",
+    jevConfigFile: null,
+    jevModeOverride: null,
+    jevApiKeyOverrides: { typesafe: "", openrouter: "" },
   };
 }
 
@@ -89,6 +103,13 @@ input.on("line", (line) => {
 });
 `);
   return script;
+}
+
+function writeJevConfig(config, document) {
+  const path = join(config.root, "jev.json");
+  writeFileSync(path, JSON.stringify(document));
+  config.jevConfigFile = path;
+  return path;
 }
 
 test("loadDelegationSets normalizes models and reasoning", () => {
@@ -149,6 +170,23 @@ test("resolveDelegationOptions applies explicit overrides", () => {
   assert.equal(options.effectiveThinking, "xhigh");
 });
 
+test("loadJevConfig keeps Jev disabled by default and validates configured providers", () => {
+  const config = fixtureConfig();
+  assert.equal(loadJevConfig(config).mode, "off");
+  writeJevConfig(config, {
+    version: 1,
+    mode: "observe",
+    provider: { name: "openrouter", model: "typesafe/jev-1.13", api_key_env: "OPENROUTER_API_KEY" },
+    decisions: { delegation_set: { enabled: true, allowed_values: ["default", "fast"] } },
+  });
+  const jev = loadJevConfig(config);
+  assert.equal(jev.mode, "observe");
+  assert.equal(jev.provider.name, "openrouter");
+  assert.deepEqual(jev.decisions.delegation_set.allowedValues, ["default", "fast"]);
+  writeJevConfig(config, { mode: "auto", provider: { name: "chat" } });
+  assert.throws(() => loadJevConfig(config), /provider.name must be one of/);
+});
+
 test("normalizeAllowedPaths deduplicates safe relative paths", () => {
   const config = fixtureConfig();
   assert.deepEqual(normalizeAllowedPaths(["pi-delegator/mcp", "./pi-delegator/mcp"], config.root, true), ["pi-delegator/mcp"]);
@@ -168,6 +206,12 @@ test("MCP tool schemas reject unknown properties", () => {
 test("MCP writer schemas require allowed_paths", () => {
   const definition = TOOL_DEFINITIONS.find((tool) => tool.name === "pi_implement");
   assert.throws(() => validateToolArguments(definition, { task: "Edit one file" }), /allowed_paths is required/);
+});
+
+test("pi_route schema accepts optional allowed_paths", () => {
+  const definition = TOOL_DEFINITIONS.find((tool) => tool.name === "pi_route");
+  validateToolArguments(definition, { task: "Route this task" });
+  validateToolArguments(definition, { task: "Route this task", allowed_paths: ["src"] });
 });
 
 test("MCP schemas validate timeout and reasoning values", () => {
@@ -195,6 +239,150 @@ test("callTool routes background delegation through native RPC", async () => {
     assert.match(result.content[0].text, /RUN_ID: run-native-1/);
     assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
     assert.match(result.content[0].text, /STATUS: PARTIAL/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("Jev observe records a delegation_set recommendation without applying it", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "observe",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { delegation_set: { enabled: true, allowed_values: ["default", "fast"], min_choice_probability: 0.8, min_confidence: 0.8 } },
+  });
+  config.jevDecisionClient = async () => ({ choice: "fast", probability: 0.95, confidence: 0.95 });
+  try {
+    const result = await callTool("pi_research", { task: "Inspect README", background: true }, config);
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("Jev auto can apply a delegation_set when no explicit set is provided", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { delegation_set: { enabled: true, allowed_values: ["default", "fast"], min_choice_probability: 0.8, min_confidence: 0.8 } },
+  });
+  config.jevDecisionClient = async () => ({ choice: "fast", probability: 0.95, confidence: 0.95 });
+  try {
+    const result = await callTool("pi_research", { task: "Inspect README", background: true }, config);
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-large:high/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("explicit delegation_set bypasses Jev delegation_set selection", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { delegation_set: { enabled: true, allowed_values: ["default", "fast"] } },
+  });
+  let called = false;
+  config.jevDecisionClient = async () => {
+    called = true;
+    return { choice: "fast", probability: 1, confidence: 1 };
+  };
+  try {
+    const result = await callTool("pi_research", { task: "Inspect README", delegation_set: "default", background: true }, config);
+    assert.equal(result.isError, false);
+    assert.equal(called, false);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route uses Jev initial_role for read-only routing", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { initial_role: { enabled: true, allowed_values: ["researcher", "reviewer"], min_choice_probability: 0.8, min_confidence: 0.8 } },
+  });
+  config.jevDecisionClient = async () => ({ choice: "reviewer", probability: 0.95, confidence: 0.95 });
+  try {
+    const result = await callTool("pi_route", { task: "Review the proposed change", background: true }, config);
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /ROLE: reviewer/);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route blocks Jev-selected writer roles without allowed_paths", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { initial_role: { enabled: true, allowed_values: ["coder"], min_choice_probability: 0.8, min_confidence: 0.8 } },
+  });
+  config.jevDecisionClient = async () => ({ choice: "coder", probability: 0.95, confidence: 0.95 });
+  try {
+    const result = await callTool("pi_route", { task: "Implement this", background: true }, config);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /allowed_paths is required/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route can ask for clarification before spawning", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: { request_sufficiency: { enabled: true, allowed_values: ["sufficient", "needs_clarification"], min_choice_probability: 0.8, min_confidence: 0.8 } },
+  });
+  config.jevDecisionClient = async ({ decision }) => {
+    assert.equal(decision, "request_sufficiency");
+    return { choice: "needs_clarification", probability: 0.95, confidence: 0.95 };
+  };
+  try {
+    const result = await callTool("pi_route", { task: "Do the thing" }, config);
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /STATUS: PARTIAL/);
+    assert.match(result.content[0].text, /asking for clarification/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route can run research before a Jev-selected writer role", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto",
+    provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
+    decisions: {
+      initial_role: { enabled: true, allowed_values: ["coder"], min_choice_probability: 0.8, min_confidence: 0.8 },
+      research_first: { enabled: true, allowed_values: ["yes", "no"], min_choice_probability: 0.8, min_confidence: 0.8 },
+    },
+  });
+  config.jevDecisionClient = async ({ decision }) => (
+    decision === "initial_role"
+      ? { choice: "coder", probability: 0.95, confidence: 0.95 }
+      : { choice: "yes", probability: 0.95, confidence: 0.95 }
+  );
+  try {
+    const result = await callTool("pi_route", { task: "Implement this", allowed_paths: ["src"], background: true }, config);
+    assert.equal(result.isError, false);
+    assert.match(result.content[0].text, /ROLE: researcher/);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
   } finally {
     await shutdownRpcHost(config);
   }

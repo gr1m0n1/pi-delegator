@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "mode": "off",
+  "provider": {
+    "name": "typesafe",
+    "model": "jev-latest",
+    "api_key_env": "TYPESAFE_API_KEY"
+  },
+  "timeout_ms": 1500,
+  "max_calls_per_task": 1,
+  "fallback": "existing_behavior",
+  "decisions": {
+    "delegation_set": {
+      "enabled": true,
+      "allowed_values": ["default", "fast", "balanced", "deep"],
+      "min_choice_probability": 0.9,
+      "min_confidence": 0.8
+    },
+    "initial_role": {
+      "enabled": false,
+      "allowed_values": ["orchestrator", "researcher", "coder", "tester", "reviewer"],
+      "min_choice_probability": 0.9,
+      "min_confidence": 0.8
+    },
+    "research_first": {
+      "enabled": false,
+      "allowed_values": ["yes", "no"],
+      "min_choice_probability": 0.9,
+      "min_confidence": 0.8
+    },
+    "request_sufficiency": {
+      "enabled": false,
+      "allowed_values": ["sufficient", "needs_clarification"],
+      "min_choice_probability": 0.9,
+      "min_confidence": 0.8
+    },
+    "additional_review_focus": {
+      "enabled": false,
+      "allowed_values": ["none", "tests", "security", "architecture", "regression"],
+      "min_choice_probability": 0.9,
+      "min_confidence": 0.8
+    }
+  }
+}
