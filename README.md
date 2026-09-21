@@ -92,8 +92,8 @@ This updates:
 ## Flow
 
 1. `install.sh` installs Pi and creates `.pi-delegator/`.
-2. `sync_pi_installation.mjs` copies only what Pi needs into `.pi-delegator/`.
-3. `render_pi_config.mjs` generates `models.json` and `subagents.json` from the local environment.
+2. `sync_pi_installation.mjs` refreshes `.pi-delegator/delegation-sets.example.json` and `.pi-delegator/models.example.json`. It creates `delegation-sets.json` from the example only when the active file is missing.
+3. `render_pi_config.mjs` creates `models.json` from the local environment only when it is missing, and refreshes `subagents.json`. Reinstalling preserves both active JSON configurations.
 4. `check_pi_setup.sh` validates that Pi, Node, and LiteLLM are operational.
 5. `./.pi-delegator/bin/pi-agent` runs the main orchestrator.
 6. `./.pi-delegator/bin/pi-mcp` exposes delegation through MCP over a persistent native Pi RPC host.
