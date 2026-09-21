@@ -82,6 +82,7 @@ function fakeRpcHostScript(directory, terminalStatus = "COMPLETED") {
   const script = join(directory, "fake-mcp-rpc-host.mjs");
   writeFileSync(script, `
 import readline from "node:readline";
+import { writeFileSync } from "node:fs";
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 function reply(requestId, data) {
   const payload = Buffer.from(JSON.stringify({ requestId, success: true, data }), "utf8").toString("base64url");
@@ -94,6 +95,7 @@ input.on("line", (line) => {
   if (request.method === "ping") reply(request.requestId, { capabilities: { status: true, spawn: true, wait: true, stop: true, steer: true, resume: true } });
   else if (request.method === "spawn") {
     if (!request.params.agent || !request.params.task) throw new Error("spawn requires agent and task");
+    writeFileSync(${JSON.stringify(join(directory, "last-spawn.json"))}, JSON.stringify(request.params));
     reply(request.requestId, { text: "Async: researcher-mcp [run-native-1]", details: { asyncId: "run-native-1" } });
   }
   else if (request.method === "status") reply(request.requestId, request.params.id
@@ -185,6 +187,10 @@ test("loadJevConfig keeps Jev disabled by default and validates configured provi
   assert.deepEqual(jev.decisions.delegation_set.allowedValues, ["default", "fast"]);
   writeJevConfig(config, { mode: "auto", provider: { name: "chat" } });
   assert.throws(() => loadJevConfig(config), /provider.name must be one of/);
+  writeJevConfig(config, { mode: "auto", max_calls_per_task: 0 });
+  assert.throws(() => loadJevConfig(config), /max_calls_per_task must be an integer/);
+  writeJevConfig(config, { mode: "auto", fallback: "switch_provider" });
+  assert.throws(() => loadJevConfig(config), /Unsupported Jev fallback/);
 });
 
 test("normalizeAllowedPaths deduplicates safe relative paths", () => {
@@ -280,6 +286,106 @@ test("Jev auto can apply a delegation_set when no explicit set is provided", asy
   }
 });
 
+test("TypeSafe and OpenRouter receive a Choice map and apply the documented answer", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const provider of ["typesafe", "openrouter"]) {
+      const config = fixtureConfig();
+      config.rpcArgs = [fakeRpcHostScript(config.root)];
+      config.jevApiKeyOverrides[provider] = "test-key";
+      writeJevConfig(config, {
+        mode: "auto",
+        provider: { name: provider, model: provider === "typesafe" ? "jev-latest" : "typesafe/jev-1.13" },
+        decisions: { delegation_set: { enabled: true, min_choice_probability: 0.8, min_confidence: 0.8 } },
+      });
+      globalThis.fetch = async (url, options) => {
+        assert.equal(url, provider === "typesafe" ? "https://api.typesafe.ai/v1/systemone" : "https://openrouter.ai/api/v1/alpha/decisions");
+        assert.equal(options.headers.authorization, "Bearer test-key");
+        const body = JSON.parse(options.body);
+        assert.deepEqual(Object.keys(body.questions), ["delegation_set"]);
+        assert.equal(body.questions.delegation_set.type, "choice");
+        assert.deepEqual(Object.keys(body.questions.delegation_set.criteria), ["default", "fast"]);
+        return { ok: true, json: async () => ({ answers: { delegation_set: {
+          type: "choice", choice: "fast", probabilities: { default: 0.05, fast: 0.95 }, confidence: 0.9,
+        } } }) };
+      };
+      try {
+        const result = await callTool("pi_research", { task: "Inspect this", background: true }, config);
+        assert.match(result.content[0].text, /MODEL: litellm\/llm-large:high/);
+      } finally {
+        await shutdownRpcHost(config);
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("malformed Jev responses fall back to the configured delegation set", async () => {
+  const originalFetch = globalThis.fetch;
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  config.jevApiKeyOverrides.typesafe = "test-key";
+  writeJevConfig(config, { mode: "auto", decisions: { delegation_set: { enabled: true } } });
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ answers: { delegation_set: { type: "choice", choice: "unknown", probabilities: { unknown: 1 }, confidence: 1 } } }) });
+  try {
+    const result = await callTool("pi_research", { task: "Inspect this", background: true }, config);
+    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
+    const log = readFileSync(join(config.root, "logs", "pi-jev-decisions.jsonl"), "utf8");
+    assert.match(log, /"fallback_code":"invalid_response"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route enforces the configured Jev call limit", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto", max_calls_per_task: 1,
+    decisions: {
+      initial_role: { enabled: true },
+      research_first: { enabled: true },
+    },
+  });
+  const called = [];
+  config.jevDecisionClient = async ({ decision }) => {
+    called.push(decision);
+    return { choice: decision === "initial_role" ? "coder" : "yes", probability: 0.95, confidence: 0.95 };
+  };
+  try {
+    const result = await callTool("pi_route", { task: "Implement this", allowed_paths: ["src"], background: true }, config);
+    assert.deepEqual(called, ["initial_role"]);
+    assert.match(result.content[0].text, /ROLE: coder/);
+    const log = readFileSync(join(config.root, "logs", "pi-jev-decisions.jsonl"), "utf8");
+    assert.match(log, /"fallback_code":"call_limit"/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
+test("pi_route sends an applied review focus through the orchestrator", async () => {
+  const config = fixtureConfig();
+  config.rpcArgs = [fakeRpcHostScript(config.root)];
+  writeJevConfig(config, {
+    mode: "auto", max_calls_per_task: 2,
+    decisions: { initial_role: { enabled: true }, additional_review_focus: { enabled: true } },
+  });
+  config.jevDecisionClient = async ({ decision }) => ({
+    choice: decision === "initial_role" ? "coder" : "security", probability: 0.95, confidence: 0.95,
+  });
+  try {
+    const result = await callTool("pi_route", { task: "Implement this", task_id: "TASK-review", allowed_paths: ["src"], background: true }, config);
+    assert.match(result.content[0].text, /ROLE: orchestrator/);
+    const spawn = JSON.parse(readFileSync(join(config.root, "last-spawn.json"), "utf8"));
+    assert.match(spawn.task, /REVIEW_FOCUS: Delegate a reviewer after the work and ask it to focus on security/);
+    assert.match(spawn.task, /TASK_ID: TASK-review/);
+  } finally {
+    await shutdownRpcHost(config);
+  }
+});
+
 test("explicit delegation_set bypasses Jev delegation_set selection", async () => {
   const config = fixtureConfig();
   config.rpcArgs = [fakeRpcHostScript(config.root)];
@@ -367,6 +473,7 @@ test("pi_route can run research before a Jev-selected writer role", async () => 
   config.rpcArgs = [fakeRpcHostScript(config.root)];
   writeJevConfig(config, {
     mode: "auto",
+    max_calls_per_task: 2,
     provider: { name: "typesafe", model: "jev-latest", api_key_env: "TYPESAFE_API_KEY" },
     decisions: {
       initial_role: { enabled: true, allowed_values: ["coder"], min_choice_probability: 0.8, min_confidence: 0.8 },
@@ -381,8 +488,9 @@ test("pi_route can run research before a Jev-selected writer role", async () => 
   try {
     const result = await callTool("pi_route", { task: "Implement this", allowed_paths: ["src"], background: true }, config);
     assert.equal(result.isError, false);
-    assert.match(result.content[0].text, /ROLE: researcher/);
-    assert.match(result.content[0].text, /MODEL: litellm\/llm-medium:off/);
+    assert.match(result.content[0].text, /ROLE: orchestrator/);
+    const spawn = JSON.parse(readFileSync(join(config.root, "last-spawn.json"), "utf8"));
+    assert.match(spawn.task, /Delegate research first; use its findings as context for the coder task/);
   } finally {
     await shutdownRpcHost(config);
   }
