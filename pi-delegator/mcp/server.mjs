@@ -39,7 +39,7 @@ const MAX_ACTIVITY_EVENTS = 100;
 const ACTIVE_SESSION_STALE_MS = integer(process.env.PI_ACTIVE_SESSION_STALE_MS, 90_000, 10_000, 3_600_000);
 const FALLBACK_DELEGATION_SET = "default";
 const SET_ROLES = ["research", "implement", "tests", "review", "orchestrate"];
-const REASONING_LEVELS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const REASONING_LEVELS = new Set(["none", "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const REQUIRED_REPOSITORY_TOOL_GROUPS = [
   {
     name: "RepoVerity",
@@ -260,7 +260,7 @@ function allowedModels(config) {
 }
 
 function effectiveThinking(model, reasoning, config) {
-  if (!model || reasoning === "none") return "off";
+  if (!model || reasoning === "none" || reasoning === "off") return "off";
   const document = parseJsonFile(config.modelCatalogFile, "Pi model catalog");
   const alias = model.replace(/^litellm\//, "");
   const entry = document?.providers?.litellm?.models?.find((candidate) => candidate.id === alias);
@@ -312,11 +312,26 @@ export function loadDelegationSets(config = createConfig()) {
       if (!options || typeof options !== "object" || Array.isArray(options)) {
         throw new Error(`Delegation role ${setName}.${role} must be an object`);
       }
-      const unknownOptions = Object.keys(options).filter((key) => !["model", "reasoning"].includes(key));
+      const unknownOptions = Object.keys(options).filter((key) => !["model", "reasoning", "fallback"].includes(key));
       if (unknownOptions.length) throw new Error(`Unknown options in ${setName}.${role}: ${unknownOptions.join(", ")}`);
+      let fallback = null;
+      if (options.fallback !== undefined) {
+        if (!options.fallback || typeof options.fallback !== "object" || Array.isArray(options.fallback)) {
+          throw new Error(`Fallback in ${setName}.${role} must be an object`);
+        }
+        const unknownFallbackOptions = Object.keys(options.fallback).filter((key) => !["model", "reasoning"].includes(key));
+        if (unknownFallbackOptions.length) {
+          throw new Error(`Unknown fallback options in ${setName}.${role}: ${unknownFallbackOptions.join(", ")}`);
+        }
+        fallback = {
+          model: normalizeModel(options.fallback.model, config),
+          reasoning: validateReasoning(options.fallback.reasoning),
+        };
+      }
       roles[role] = {
         model: normalizeModel(options.model, config),
         reasoning: validateReasoning(options.reasoning),
+        ...(fallback ? { fallback } : {}),
       };
     }
     parsed[setName.trim()] = { delegation_percentage: percentage, roles };
@@ -326,7 +341,7 @@ export function loadDelegationSets(config = createConfig()) {
 
 export function resolveDelegationOptions(role, args, config = createConfig()) {
   const selectedSet = cleanText(args.delegation_set, "delegation_set") || config.defaultDelegationSet;
-  let configured = { model: "", reasoning: "" };
+  let configured = { model: "", reasoning: "", fallback: null };
   let configuredPercentage = null;
   let sets = null;
   if (selectedSet) {
@@ -345,6 +360,13 @@ export function resolveDelegationOptions(role, args, config = createConfig()) {
     model,
     requestedReasoning: reasoning,
     effectiveThinking: effectiveThinking(model, reasoning, config),
+    fallback: configured.fallback
+      ? {
+          model: configured.fallback.model,
+          reasoning: configured.fallback.reasoning,
+          effectiveThinking: effectiveThinking(configured.fallback.model, configured.fallback.reasoning, config),
+        }
+      : null,
     roles: sets && selectedSet ? sets[selectedSet].roles : null,
   };
 }
@@ -450,7 +472,7 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
   const agentType = dynamicProfile ? ROLE_AGENT_TYPES[role] : role;
   const agent = role === "orchestrator" ? "the minimum necessary specialist agents" : agentType;
   const agentParameters = dynamicProfile && role !== "orchestrator"
-    ? ` Pass model: \"${resolution.model}\" and thinking: \"${resolution.effectiveThinking}\" in the Agent call.`
+    ? ` Pass model: \"${resolution.model}\" and thinking: \"${resolution.effectiveThinking}\" in the Agent call.${resolution.fallback ? ` If that call fails because the model is excluded or unavailable, retry once with model: \"${resolution.fallback.model}\" and thinking: \"${resolution.fallback.effectiveThinking}\".` : ""}`
     : "";
   const routing = role === "orchestrator"
     ? "Coordinate the task through Agent calls. Use the MCP agent types and role routing below only as needed. Do not perform task work in main."
@@ -459,7 +481,11 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
     ? SET_ROLES.filter((profileRole) => profileRole !== "orchestrate").map((profileRole) => {
       const logicalRole = Object.entries(ROLE_PROFILE_KEYS).find(([, key]) => key === profileRole)?.[0];
       const options = resolution.roles[profileRole];
-      return `${logicalRole}: subagent_type=${ROLE_AGENT_TYPES[logicalRole]}, model=${options.model}, thinking=off, requested_reasoning=${options.reasoning}`;
+      const thinking = effectiveThinking(options.model, options.reasoning, config);
+      const fallback = options.fallback
+        ? `, fallback_model=${options.fallback.model}, fallback_thinking=${effectiveThinking(options.fallback.model, options.fallback.reasoning, config)}`
+        : "";
+      return `${logicalRole}: subagent_type=${ROLE_AGENT_TYPES[logicalRole]}, model=${options.model}, thinking=${thinking}, requested_reasoning=${options.reasoning}${fallback}`;
     })
     : [];
 
@@ -472,6 +498,11 @@ export function buildPrompt(role, args, config, resolution = resolveDelegationOp
     `ROLE_MODEL: ${resolution.model || "agent profile default"}`,
     `ROLE_REASONING_REQUESTED: ${resolution.requestedReasoning || "unspecified"}`,
     `ROLE_THINKING_EFFECTIVE: ${resolution.effectiveThinking}`,
+    ...(resolution.fallback ? [
+      `ROLE_FALLBACK_MODEL: ${resolution.fallback.model}`,
+      `ROLE_FALLBACK_REASONING_REQUESTED: ${resolution.fallback.reasoning || "unspecified"}`,
+      `ROLE_FALLBACK_THINKING_EFFECTIVE: ${resolution.fallback.effectiveThinking}`,
+    ] : []),
     ...(setRouting.length ? ["SET_ROLE_ROUTING:", ...setRouting] : []),
     "",
     `TASK_ID: ${taskId}`,

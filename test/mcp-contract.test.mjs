@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   TOOL_DEFINITIONS,
   activity,
+  buildPrompt,
   callTool,
   createConfig,
   loadDelegationSets,
@@ -23,7 +24,7 @@ function fixtureConfig() {
   const delegationSetsFile = join(root, "delegation-sets.json");
   const modelCatalogFile = join(root, "models.json");
   writeFileSync(modelCatalogFile, JSON.stringify({
-    providers: { litellm: { models: [{ id: "llm-large", reasoning: true }, { id: "llm-medium", reasoning: false }] } },
+    providers: { litellm: { models: [{ id: "llm-large", reasoning: true }, { id: "llm-medium-devel", reasoning: false }, { id: "llm-medium", reasoning: false }] } },
   }));
   writeFileSync(delegationSetsFile, JSON.stringify({
     version: 1,
@@ -97,12 +98,43 @@ test("loadDelegationSets normalizes models and reasoning", () => {
   assert.equal(sets.default.roles.orchestrate.reasoning, "high");
 });
 
+test("loadDelegationSets accepts off as disabled reasoning", () => {
+  const config = fixtureConfig();
+  const document = JSON.parse(readFileSync(config.delegationSetsFile, "utf8"));
+  document.sets.default.roles.research.reasoning = "off";
+  writeFileSync(config.delegationSetsFile, JSON.stringify(document));
+
+  const options = resolveDelegationOptions("researcher", {}, config);
+  assert.equal(options.requestedReasoning, "off");
+  assert.equal(options.effectiveThinking, "off");
+});
+
 test("loadDelegationSets rejects unknown role options", () => {
   const config = fixtureConfig();
   const document = JSON.parse(readFileSync(config.delegationSetsFile, "utf8"));
   document.sets.default.roles.research.extra = true;
   writeFileSync(config.delegationSetsFile, JSON.stringify(document));
   assert.throws(() => loadDelegationSets(config), /Unknown options in default\.research: extra/);
+});
+
+test("loadDelegationSets validates and preserves separated fallbacks", () => {
+  const config = fixtureConfig();
+  const document = JSON.parse(readFileSync(config.delegationSetsFile, "utf8"));
+  document.sets.default.roles.implement.fallback = { model: "llm-medium-devel", reasoning: "low" };
+  writeFileSync(config.delegationSetsFile, JSON.stringify(document));
+
+  const options = resolveDelegationOptions("coder", {}, config);
+  assert.equal(options.model, "litellm/llm-large");
+  assert.equal(options.requestedReasoning, "medium");
+  assert.deepEqual(options.fallback, {
+    model: "litellm/llm-medium-devel",
+    reasoning: "low",
+    effectiveThinking: "off",
+  });
+
+  const prompt = buildPrompt("coder", { task: "Implement the fix", allowed_paths: ["src"] }, config, options);
+  assert.match(String(prompt), /ROLE_FALLBACK_MODEL: litellm\/llm-medium-devel/);
+  assert.match(String(prompt), /retry once with model: "litellm\/llm-medium-devel" and thinking: "off"/);
 });
 
 test("resolveDelegationOptions applies explicit overrides", () => {
