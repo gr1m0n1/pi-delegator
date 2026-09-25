@@ -3,6 +3,23 @@
     "pi-delegator": {
       "command": "./.pi-delegator/bin/pi-mcp",
       "args": []
+    },
+    "repoverity": {
+      "type": "stdio",
+      "command": "/home/sergien/.local/share/repoverity-mcp/repoverity/bin/repoverity-mcp-gateway",
+      "args": [
+        "--name",
+        "repoverity",
+        "--repository",
+        "pi-delegator",
+        "--logical-ref",
+        "development",
+        "--remote-url",
+        "http://10.200.0.30:8787",
+        "--token-file",
+        "/home/sergien/.config/repoverity/codex.token"
+      ],
+      "cwd": "/home/sergien/gr1m0n1/pi-delegator"
     }
   }
 }

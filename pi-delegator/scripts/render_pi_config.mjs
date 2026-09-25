@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { syncPiInstallation } from "./sync_pi_installation.mjs";
@@ -58,7 +59,12 @@ const models = modelTemplate
   .replaceAll("$LITELLM_API_KEY", process.env.LITELLM_API_KEY);
 JSON.parse(models);
 if (/__[A-Z0-9_]+__/.test(models)) throw new Error("unresolved placeholder in models.json");
-await atomicWrite(`${runtime}/models.json`, models);
+const modelsPath = `${runtime}/models.json`;
+if (existsSync(modelsPath)) {
+  console.log(`Preserved existing ${modelsPath}`);
+} else {
+  await atomicWrite(modelsPath, models);
+}
 
 const subagentTemplate = await readFile(`${sourceDir}/subagents.json.template`, "utf8");
 const subagents = subagentTemplate

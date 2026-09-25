@@ -1,0 +1,98 @@
+{
+  "name": "pi-delegator-activity",
+  "displayName": "Pi Delegator Activity",
+  "description": "Live Pi subagent activity for pi-delegator runtimes.",
+  "version": "0.1.0",
+  "publisher": "pi-delegator",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "piDelegatorActivity.refresh",
+        "title": "Refresh Pi Delegator Activity"
+      },
+      {
+        "command": "piDelegatorActivity.openLog",
+        "title": "Open Pi Delegator Activity Log"
+      },
+      {
+        "command": "piDelegatorActivity.openAgentOutput",
+        "title": "Open Pi Agent Output"
+      },
+      {
+        "command": "piDelegatorActivity.selectLog",
+        "title": "Select Pi Delegator Runtime Log"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "piDelegator",
+          "title": "Pi Delegator",
+          "icon": "media/pi-delegator.svg"
+        }
+      ]
+    },
+    "views": {
+      "piDelegator": [
+        {
+          "id": "piDelegator.activity",
+          "name": "Activity"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Pi Delegator",
+      "properties": {
+        "piDelegator.activity.logPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional absolute path to pi-agents.jsonl."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "piDelegatorActivity.refresh",
+          "when": "view == piDelegator.activity",
+          "group": "navigation"
+        },
+        {
+          "command": "piDelegatorActivity.openLog",
+          "when": "view == piDelegator.activity",
+          "group": "navigation"
+        },
+        {
+          "command": "piDelegatorActivity.selectLog",
+          "when": "view == piDelegator.activity",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "piDelegatorActivity.openAgentOutput",
+          "when": "view == piDelegator.activity && viewItem == piDelegator.agent",
+          "group": "inline"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package --no-dependencies --allow-missing-repository --skip-license"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.2.0",
+    "typescript": "^5.7.2"
+  }
+}

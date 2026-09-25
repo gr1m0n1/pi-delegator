@@ -1,0 +1,24 @@
+{
+  "provider": "duckduckgo",
+  "workflow": "none",
+  "allowBrowserCookies": false,
+  "fetchRouting": {
+    "providers": ["http"],
+    "allowRemoteHostedProviders": false
+  },
+  "githubClone": {
+    "enabled": false
+  },
+  "githubPrIssue": {
+    "enabled": false
+  },
+  "youtube": {
+    "enabled": false
+  },
+  "video": {
+    "enabled": false
+  },
+  "ssrf": {
+    "trustEnvProxy": false
+  }
+}

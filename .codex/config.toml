@@ -3,3 +3,19 @@
 command = "./.pi-delegator/bin/pi-mcp"
 args = []
 # END pi-delegator managed MCP
+
+# BEGIN managed RepoVerity MCP: repoverity
+[mcp_servers.repoverity]
+command = "/home/sergien/.local/share/repoverity-mcp/repoverity/bin/repoverity-mcp-gateway"
+args = [
+  "--name", "repoverity",
+  "--repository", "pi-delegator",
+  "--logical-ref", "development",
+  "--remote-url", "http://10.200.0.30:8787",
+  "--token-file", "/home/sergien/.config/repoverity/codex.token",
+]
+cwd = "/home/sergien/gr1m0n1/pi-delegator"
+required = false
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+# END managed RepoVerity MCP: repoverity
