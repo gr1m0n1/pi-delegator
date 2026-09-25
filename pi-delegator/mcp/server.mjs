@@ -126,6 +126,7 @@ export function createConfig(env = process.env) {
   for (const toolName of configuredContextModeTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
   for (const toolName of configuredRepoVerityTools(root, runtimeRoot, env)) availableExternalTools.add(toolName);
   const launcher = resolve(env.PI_MCP_PI_AGENT || resolve(runtimeRoot, "bin/pi-agent"));
+  const activeModelCatalog = resolve(runtimeRoot, "models.json");
   return {
     root,
     runtimeRoot,
@@ -134,7 +135,7 @@ export function createConfig(env = process.env) {
     timeoutSeconds: normalizeTimeoutSeconds(env.PI_MCP_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS),
     maxOutputChars: integer(env.PI_MCP_MAX_OUTPUT_CHARS, 50000, 1000, 500000),
     delegationSetsFile: resolve(env.PI_DELEGATION_SETS_FILE || resolve(runtimeRoot, "delegation-sets.json")),
-    modelCatalogFile: resolve(env.PI_MODELS_CATALOG_FILE || resolve(runtimeRoot, "models.json.template")),
+    modelCatalogFile: resolve(env.PI_MODELS_CATALOG_FILE || (existsSync(activeModelCatalog) ? activeModelCatalog : resolve(runtimeRoot, "models.example.json"))),
     defaultDelegationSet: String(env.PI_DEFAULT_DELEGATION_SET || FALLBACK_DELEGATION_SET).trim() || FALLBACK_DELEGATION_SET,
     availableExternalTools,
     forceContextMode: booleanFlag(env.PI_FORCE_CONTEXT_MODE, true),
@@ -542,7 +543,7 @@ async function callJevProvider(jevConfig, decision, state, allowedValues) {
     questions: { [decision]: question },
   };
   const endpoint = jevConfig.provider.name === "openrouter"
-    ? "https://openrouter.ai/api/v1/alpha/decisions"
+    ? "https://openrouter.ai/api/alpha/decisions"
     : "https://api.typesafe.ai/v1/systemone";
   const response = await fetch(endpoint, {
     method: "POST",

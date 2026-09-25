@@ -40,3 +40,6 @@ pnpm-debug.log*
 # Pi installation, rendered configuration, sessions, and runtime state
 .codex/
 .pi-delegator/
+.vscode/
+.gstack/
+.vscode/

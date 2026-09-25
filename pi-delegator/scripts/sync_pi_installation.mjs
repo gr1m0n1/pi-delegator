@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { chmod, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,12 +12,15 @@ const inPlaceSync = relative(sourceDir, installDir) === "" && relative(installDi
 const workspaceMetadataFile = ".pixel-agents-workspace-root";
 const managedFiles = [
   "APPEND_SYSTEM.md",
-  "delegation-sets.json",
-  "models.json.template",
+  "jev-config.example.json",
   "pi.env.example",
   "settings.json",
   "subagents.json.template",
   "web-search.json",
+];
+const exampleFiles = [
+  ["delegation-sets.json", "delegation-sets.example.json"],
+  ["models.json.template", "models.example.json"],
 ];
 const managedDirectories = [
   "agents",
@@ -210,7 +213,6 @@ workspace_root_file="\${PI_CODING_AGENT_DIR}/${workspaceMetadataFile}"
 export PI_MCP_ALLOWED_ROOT="\${PI_MCP_ALLOWED_ROOT:-\${project_root}}"
 export PI_MCP_PI_AGENT="\${PI_MCP_PI_AGENT:-\${PI_CODING_AGENT_DIR}/bin/pi-agent}"
 export PI_DELEGATION_SETS_FILE="\${PI_DELEGATION_SETS_FILE:-\${PI_CODING_AGENT_DIR}/delegation-sets.json}"
-export PI_MODELS_CATALOG_FILE="\${PI_MODELS_CATALOG_FILE:-\${PI_CODING_AGENT_DIR}/models.json.template}"
 if [[ -z "\${PI_PIXEL_AGENTS_WORKSPACE_CWD:-}" && -f "\$workspace_root_file" ]]; then
   PI_PIXEL_AGENTS_WORKSPACE_CWD="$(head -n 1 "\$workspace_root_file" | tr -d '\r')"
   export PI_PIXEL_AGENTS_WORKSPACE_CWD
@@ -242,6 +244,20 @@ export async function syncPiInstallation() {
 
     for (const file of managedFiles) {
       await copyFile(resolve(sourceDir, file), resolve(installDir, file));
+    }
+
+    for (const [source, example] of exampleFiles) {
+      await copyFile(resolve(sourceDir, source), resolve(installDir, example));
+    }
+
+    try {
+      await copyFile(
+        resolve(installDir, "delegation-sets.example.json"),
+        resolve(installDir, "delegation-sets.json"),
+        constants.COPYFILE_EXCL,
+      );
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
     }
   }
 
