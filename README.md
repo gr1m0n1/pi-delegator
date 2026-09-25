@@ -33,9 +33,9 @@ The model is simple:
 
 ```bash
 PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh
+# Edit .pi-delegator/pi.env with your LiteLLM endpoint and API key.
 ./.pi-delegator/scripts/check_pi_setup.sh
 ./.pi-delegator/bin/pi-agent
-./.pi-delegator/bin/pi
 ```
 
 To install `.pi-delegator/` inside another repository or directory:
@@ -43,12 +43,51 @@ To install `.pi-delegator/` inside another repository or directory:
 ```bash
 PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh --install-dir /path/to/target-repo
 cd /path/to/target-repo
+# Edit .pi-delegator/pi.env with your LiteLLM endpoint and API key.
 ./.pi-delegator/scripts/check_pi_setup.sh
 ./.pi-delegator/bin/pi-agent
-./.pi-delegator/bin/pi
 ```
 
-The package override is needed while `install.sh` still defaults to the legacy `@tintinweb/pi-subagents@0.17.0`; the checked-in Pi settings and RPC bridge use `pi-subagents@0.65.0`.
+The package override is required because `install.sh` still defaults to the legacy `@tintinweb/pi-subagents@0.17.0`, while the checked-in Pi settings and setup check require `pi-subagents@0.65.0`. The installer requires `nvm` and installs Node `22.22.1`, `@earendil-works/pi-coding-agent@0.84.2`, context-mode, and the configured Pi packages. Run `./.pi-delegator/bin/pi` if you want the direct Pi CLI instead of the configured orchestrator.
+
+## Configuration
+
+The installer copies [`pi.env.example`](pi-delegator/pi.env.example) to the target repository's `.pi-delegator/pi.env` only when that file does not exist. Edit **the generated `pi.env` in the target repository** before running the setup check or starting `pi-agent`. It is local, unversioned runtime state; keep the API key there rather than in a tracked config file. The launchers and setup check source this file. Values defined in it override previously exported variables of the same name; use `PI_AGENT_ENV_FILE` to select a different environment file.
+
+| Setting in `.pi-delegator/pi.env` | What it controls |
+| --- | --- |
+| `LITELLM_BASE_URL`, `LITELLM_API_KEY` | Required gateway URL (absolute `http(s)` URL, usually ending in `/v1`) and API key. The setup check validates connectivity and the available models. |
+| `PI_MAIN_MODEL` | Model for `pi-agent`; defaults to `litellm/llm-large`. It must exist in the LiteLLM gateway and the Pi model catalog. |
+| `PI_DEFAULT_DELEGATION_SET` | Named set used when an MCP call does not select one; defaults to `default`. |
+| `PI_MAX_CONCURRENT`, `MAX_AGENT_TURNS`, `MAX_SUBAGENT_DEPTH` | Rendered into `subagents.json`; defaults are `4`, `20`, and `2`, respectively. |
+| `MAX_SUBAGENT_CALLS` | Maximum delegation calls available to the orchestrator; defaults to `12`. |
+| `PI_FORCE_CONTEXT_MODE`, `PI_REPOVERITY_REQUIRED` | Tool preflight policy. See [Repository Instruction Preflight](#repository-instruction-preflight) for its current limits. |
+
+Configuration files have different update rules:
+
+| File | Where to edit it and what happens on sync or restart |
+| --- | --- |
+| [`models.json.template`](pi-delegator/models.json.template) → `.pi-delegator/models.example.json` | Versioned template and refreshed example. On the first `pi-agent` launch, `render_pi_config.mjs` renders `.pi-delegator/models.json` using `LITELLM_BASE_URL` and `LITELLM_API_KEY`. Later launches preserve the active file; after changing the gateway credentials, update or remove the active file to render it again. |
+| [`subagents.json.template`](pi-delegator/subagents.json.template) → `.pi-delegator/subagents.json` | `pi-agent` renders the active file on each launch from the three limits above. Change those limits in `pi.env` or change the template for versioned defaults. |
+| [`delegation-sets.json`](pi-delegator/delegation-sets.json) → `.pi-delegator/delegation-sets.example.json` | Sync refreshes the example and creates `.pi-delegator/delegation-sets.json` only if absent. Edit the active file for local model routing; reinstalling preserves it. The model IDs in it must match the active model catalog and gateway. |
+| [`settings.json`](pi-delegator/settings.json) → `.pi-delegator/settings.json` | Pi package declarations are copied from source on sync. Keep the installed package version aligned with the declaration; the current installer needs `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0`. |
+| `.pi-delegator/mcp.json` | Managed Pi MCP configuration is regenerated on sync. It registers context-mode and, when configured, RepoVerity. Edit the source workspace's `.vscode/mcp.json` or the RepoVerity environment variables instead of this generated file. |
+
+The source templates and active files serve different purposes. In particular, editing `pi.env` does not update an existing `models.json` automatically. The rendered model file contains the API key, so keep the runtime directory private.
+
+### MCP clients and optional integrations
+
+To register the local `pi-delegator` MCP server in a client, pass one or more flags during installation (also works with `--install-dir DIR`):
+
+```bash
+PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh --all-clients
+```
+
+Use `--copilot`, `--codex`, or `--claude` individually. They update the target repository's `.vscode/mcp.json`, `.codex/config.toml`, or `.mcp.json`, respectively. For an existing installation, run `node ./pi-delegator/scripts/configure_clients.mjs --all-clients` from this source repository with `PI_MCP_ALLOWED_ROOT` and `PI_CODING_AGENT_DIR` pointing at the target repository and runtime.
+
+RepoVerity is optional. During sync, the Pi runtime copies the `repoverity` server entry from the target repository's `.vscode/mcp.json` when present. Otherwise, set `PI_REPOVERITY_REPOSITORY`, `PI_REPOVERITY_REMOTE_URL`, and `PI_REPOVERITY_TOKEN_FILE` before sync; `PI_REPOVERITY_COMMAND`, `PI_REPOVERITY_LOGICAL_REF`, and `PI_REPOVERITY_SERVER_NAME` are optional. Environment configuration takes precedence over the VS Code entry. Verify that the server points to the **target repository**. Set `PI_REPOVERITY_REQUIRED=1` to require it during preflight; see the limitation below for the RPC path.
+
+Jev decision routing is off by default. To try it, copy [the example](pi-delegator/jev-config.example.json) to a local JSON file, set `PI_JEV_CONFIG_FILE` to its absolute path in `pi.env`, and set `PI_JEV_MODE=observe` to log recommendations or `PI_JEV_MODE=auto` to apply recommendations that pass the configured thresholds. The example uses OpenRouter and needs `OPENROUTER_API_KEY`; the server also supports a Typesafe provider with `TYPESAFE_API_KEY`. Jev failures fall back to the existing routing behavior. See [the Jev proposal](docs/jev-propuesta.md) for the decisions and modes.
 
 ## Example Prompt
 
@@ -69,35 +108,20 @@ If no `delegation_set` is specified, `pi-delegator` uses the `default` set autom
 
 ## Delegation Sets
 
-- `default`: the general-purpose option. It targets `50%` delegation, uses `llm-large` with `xhigh` reasoning for orchestration and implementation, and uses `llm-medium` with reasoning off for research, tests, and review.
-- `balanced`: a mixed profile for normal development work. It keeps the orchestrator strong, gives implementation more reasoning depth, and is a good default when you want active delegation without going all-in.
-- `fast`: optimized for speed and lower reasoning cost. Use it for lighter tasks, quick inspections, or cases where turnaround matters more than depth.
-- `deep`: optimized for heavy analysis and more ambitious delegation. Use it for harder implementation, broader reviews, or tasks where extra reasoning is worth the additional cost and latency.
-
-If you also want the installer to configure local MCP clients, use one of these flags:
-
-```bash
-./.pi-delegator/scripts/install.sh --copilot
-./.pi-delegator/scripts/install.sh --codex
-./.pi-delegator/scripts/install.sh --claude
-./.pi-delegator/scripts/install.sh --all-clients
-```
-
-This updates:
-
-- `.vscode/mcp.json` for GitHub Copilot in VS Code
-- `.codex/config.toml` for Codex
-- `.mcp.json` for Claude Code in VS Code
+- `default`: `50%` delegation; `llm-large` with `xhigh` reasoning for orchestration and implementation, and `llm-medium` with reasoning off for research, tests, and review.
+- `balanced`: `60%` delegation, with `llm-medium-devel` at `high` reasoning for implementation.
+- `fast`: `75%` delegation, with `low` reasoning for every role.
+- `deep`: `90%` delegation, with `high` or `xhigh` reasoning for research, implementation, review, and orchestration.
 
 ## Flow
 
 1. `install.sh` installs Pi and creates `.pi-delegator/`.
-2. `sync_pi_installation.mjs` copies only what Pi needs into `.pi-delegator/`.
-3. `render_pi_config.mjs` generates `models.json` and `subagents.json` from the local environment.
+2. `sync_pi_installation.mjs` refreshes `.pi-delegator/delegation-sets.example.json` and `.pi-delegator/models.example.json`. It creates `delegation-sets.json` from the example only when the active file is missing.
+3. When `pi-agent` starts, `render_pi_config.mjs` creates `models.json` from the local environment only when it is missing, and rewrites `subagents.json` from the template and environment limits.
 4. `check_pi_setup.sh` validates that Pi, Node, and LiteLLM are operational.
 5. `./.pi-delegator/bin/pi-agent` runs the main orchestrator.
 6. `./.pi-delegator/bin/pi-mcp` exposes delegation through MCP over a persistent native Pi RPC host.
-7. `configure_clients.mjs` can register the local MCP server in Copilot, Codex, and Claude Code when `install.sh` is executed with client flags.
+7. `configure_clients.mjs` registers the local MCP server in Copilot, Codex, and Claude Code when `install.sh` is executed with client flags.
 
 Use `--install-dir DIR` or `--dir DIR` to choose a target repository or directory. The installer creates `DIR/.pi-delegator/`, and the generated MCP wrapper sets `PI_MCP_ALLOWED_ROOT` to `DIR` by default.
 
@@ -144,11 +168,11 @@ The RPC host process and its sessions are configured through environment variabl
 
 The server has a repository-instruction preflight that reads the target repository's root `AGENTS.md` and checks required MCP tool families. The current MCP `tools/call` delegation path uses the Pi RPC host and does not invoke that preflight. Check the delegated Pi runtime's tools before relying on repository instructions that require RepoVerity or Context Mode.
 
-context-mode is managed by this runtime: `settings.json` installs `npm:context-mode`, `mcp.json` registers the MCP server command, and `install.sh` installs the `context-mode` CLI that Pi uses to start the server. When those files are present and the CLI is on `PATH`, all `ctx_*` tools are treated as available.
+context-mode is managed by this runtime: `settings.json` declares `npm:context-mode`, `.pi-delegator/mcp.json` registers the MCP server command, and `install.sh` installs the `context-mode` CLI that Pi uses to start the server. When those files are present and the CLI is on `PATH`, all `ctx_*` tools are treated as available by the preflight.
 
 `PI_FORCE_CONTEXT_MODE=1` is the default for the preflight, but it is not currently enforced by the RPC delegation path. Agent profiles list their allowed tools, including `ctx_*` tools and, for writer profiles, `edit`/`write`.
 
-RepoVerity is integrated when available, but optional by default. During sync, pi-delegator copies a `repoverity` server from the target workspace's `.vscode/mcp.json` into the Pi runtime `mcp.json`. If no workspace MCP entry exists, set `PI_REPOVERITY_REPOSITORY`, `PI_REPOVERITY_REMOTE_URL`, `PI_REPOVERITY_TOKEN_FILE`, and optionally `PI_REPOVERITY_COMMAND`, `PI_REPOVERITY_LOGICAL_REF`, or `PI_REPOVERITY_SERVER_NAME` before running `sync_pi_installation.mjs` or `install.sh`. Set `PI_REPOVERITY_REQUIRED=1` when missing RepoVerity should block delegation.
+RepoVerity is integrated when available, but optional by default. The configuration sources and required variables are described in [MCP clients and optional integrations](#mcp-clients-and-optional-integrations).
 
 As an escape hatch for tool families managed outside pi-delegator, verified tools can still be declared with either environment variable:
 
@@ -169,7 +193,7 @@ Only set these after confirming the spawned Pi process can actually call those t
 - `@juicesharp/rpiv-ask-user-question@2.9.0`: structured clarification questions in interactive sessions.
 - `pi-web-access@0.27.0`: public web search, direct HTTP content extraction, and source verification for researcher profiles.
 
-`install.sh` currently defaults to the legacy `@tintinweb/pi-subagents@0.17.0` independently of `settings.json`. Set `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0` during installation, as shown above. The setup check verifies the other listed packages, but does not currently verify which subagent package is installed.
+`install.sh` currently defaults to the legacy `@tintinweb/pi-subagents@0.17.0` independently of `settings.json`. Set `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0` during installation, as shown above. The setup check verifies the package declaration, installed `pi-subagents` package, minimum version, and required public exports.
 
 ### Sub-Agent Package Policy
 
@@ -201,13 +225,13 @@ PI SETUP: OK
 
 - `nvm`
 - Node `22.22.1`
-- `@earendil-works/pi-coding-agent`
+- `@earendil-works/pi-coding-agent` (installed by `install.sh`)
 - a LiteLLM/OpenAI-compatible gateway configured in `.pi-delegator/pi.env`
 
 ## Useful Commands
 
 - install: `PI_SUBAGENTS_PACKAGE=pi-subagents@0.65.0 ./pi-delegator/scripts/install.sh`
-- verify: `./pi-delegator/scripts/check_pi_setup.sh`
+- verify: `./.pi-delegator/scripts/check_pi_setup.sh` (after editing `.pi-delegator/pi.env`)
 - Pixel Agents smoke test: `node ./pi-delegator/scripts/test_pixel_agents.mjs`
 - Pixel Agents smoke test against an external install: `node ./pi-delegator/scripts/test_pixel_agents.mjs --launcher /path/to/bin/pi-agent`
 - Clear stale Pixel Agents sessions: `node ./pi-delegator/scripts/clear_pixel_agents_sessions.mjs`

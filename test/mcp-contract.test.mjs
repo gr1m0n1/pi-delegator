@@ -299,7 +299,7 @@ test("TypeSafe and OpenRouter receive a Choice map and apply the documented answ
         decisions: { delegation_set: { enabled: true, min_choice_probability: 0.8, min_confidence: 0.8 } },
       });
       globalThis.fetch = async (url, options) => {
-        assert.equal(url, provider === "typesafe" ? "https://api.typesafe.ai/v1/systemone" : "https://openrouter.ai/api/v1/alpha/decisions");
+        assert.equal(url, provider === "typesafe" ? "https://api.typesafe.ai/v1/systemone" : "https://openrouter.ai/api/alpha/decisions");
         assert.equal(options.headers.authorization, "Bearer test-key");
         const body = JSON.parse(options.body);
         assert.deepEqual(Object.keys(body.questions), ["delegation_set"]);
